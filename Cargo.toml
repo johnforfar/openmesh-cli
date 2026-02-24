@@ -1,0 +1,33 @@
+[package]
+name = "om"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+keyring = "=2.3.3"
+clap = { version = "=4.4.18", features = ["derive"] }
+tokio = { version = "=1.36.0", features = ["full"] }
+anyhow = "=1.0.80"
+dialoguer = "=0.11.0"
+serde = { version = "=1.0.197", features = ["derive"] }
+serde_json = "=1.0.114"
+reqwest = { version = "=0.11.24", features = ["json", "rustls-tls", "cookies"], default-features = false }
+base64ct = "=1.6.0"
+deranged = "=0.3.11"
+time = "=0.3.36"
+k256 = { version = "=0.13.1", features = ["ecdsa"] }
+hex = "0.4"
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+coins-bip39 = "0.8.7"
+coins-bip32 = "0.8.7"
+futures = "0.3"
+dirs-next = "2.0"
+url = "2.5"
+
+[[bin]]
+name = "om"
+path = "src/main.rs"
+
+[[test]]
+name = "test_suite"
+path = "tests/test_suite.rs"

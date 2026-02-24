@@ -1,0 +1,7 @@
+target/
+**/*.rs.bk
+.openmesh_session.cookie
+.openmesh_session.jar
+/tmp/om_cookies.txt
+.env
+debug/
