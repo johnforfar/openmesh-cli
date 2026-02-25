@@ -223,9 +223,9 @@ pub async fn session_get<
     let query_params = input.query.create_query()?;
     
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("Path", (format!("{}{}", scope, path_str)).parse().unwrap());
-    headers.insert("Origin", (format!("https://{}", session.domain)).parse().unwrap());
-    headers.insert("Referer", (format!("https://{}{}{}", session.domain, scope, path_str)).parse().unwrap());
+    headers.insert("path", (format!("{}{}", scope, path_str)).parse().unwrap());
+    headers.insert("Origin", "https://xnode.openmesh.network".parse().unwrap());
+    headers.insert("Referer", "https://xnode.openmesh.network/".parse().unwrap());
 
     let resp = session
         .reqwest_client
@@ -244,8 +244,8 @@ pub async fn session_get<
             let mut curl = std::process::Command::new("curl");
             curl.arg("-s").arg("-L");
             curl.arg("-H").arg(format!("Host: {}", session.domain));
-            curl.arg("-H").arg(format!("Origin: https://{}", session.domain));
-            curl.arg("-H").arg(format!("Referer: https://{}{}{}", session.domain, scope, path_str));
+            curl.arg("-H").arg("Origin: https://xnode.openmesh.network");
+            curl.arg("-H").arg("Referer: https://xnode.openmesh.network/");
             curl.arg("-H").arg(format!("path: {}{}", scope, path_str));
             curl.arg("-A").arg("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36");
             
