@@ -351,15 +351,21 @@ async fn main() -> Result<()> {
             let session = Session::load().map_err(|_| anyhow!("Not logged in. Run 'om login' first."))?;
             match action {
                 NodeAction::Info => {
-                    println!("📡 Fetching node info from {}...", session.base_url);
-                    let input = sdk::info::FlakeInput::new_with_query(&session, sdk::info::FlakeQuery { name: None });
-                    match sdk::info::flake(input).await {
-                        Ok(flake) => {
-                            println!("✅ Node Info Fetched:");
-                            println!("   Hostname: {}", flake.hostname.unwrap_or_else(|| "N/A".to_string()));
-                            println!("   State Version: {}", flake.state_version.unwrap_or_else(|| "N/A".to_string()));
+                    println!("📡 Fetching node configuration from {}...", session.base_url);
+                    let input = sdk::os::GetInput::new(&session);
+                    match sdk::os::get(input).await {
+                        Ok(config) => {
+                            println!("✅ Node Config Fetched:");
+                            println!("   Domain: {}", config.domain.unwrap_or_else(|| "N/A".to_string()));
+                            println!("   Owner:  {}", config.xnode_owner.unwrap_or_else(|| "N/A".to_string()));
+                            if let Some(email) = config.acme_email {
+                                println!("   Email:  {}", email);
+                            }
                         }
-                        Err(e) => eprintln!("❌ Error fetching info: {:?}", e),
+                        Err(e) => {
+                            eprintln!("❌ Error: {:?}", e);
+                            println!("   Note: This endpoint might return a different schema on this node version.");
+                        }
                     }
                 }
                 NodeAction::Status => {
