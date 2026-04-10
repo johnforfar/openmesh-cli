@@ -5,11 +5,24 @@ use reqwest::{
 use serde::{Serialize, Deserialize, de::DeserializeOwned};
 use serde_json::to_value;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::future::Future;
 use url::Url;
 
 use crate::sdk::utils::Error;
+
+/// Returns true if the user has set OM_FORCE_CURL=1 (or any non-empty value other than "0").
+/// When enabled, the SDK skips the reqwest attempt entirely and goes straight to the curl
+/// fallback. This saves a round-trip on networks where reqwest is known to be blocked by
+/// strict TLS/proxy fingerprinting at the Xnode Manager nginx layer.
+fn force_curl() -> bool {
+    match std::env::var("OM_FORCE_CURL") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -227,16 +240,22 @@ pub async fn session_get<
     headers.insert("Origin", "https://xnode.openmesh.network".parse().unwrap());
     headers.insert("Referer", "https://xnode.openmesh.network/".parse().unwrap());
 
-    let resp = session
-        .reqwest_client
-        .get(&url)
-        .headers(headers)
-        .query(&query_params)
-        .send()
-        .await;
+    // Honor OM_FORCE_CURL: skip the reqwest attempt entirely when set.
+    // The known-failure path (nginx 400 on Rust client) makes the reqwest call a wasted RTT.
+    let resp = if force_curl() {
+        None
+    } else {
+        Some(session
+            .reqwest_client
+            .get(&url)
+            .headers(headers)
+            .query(&query_params)
+            .send()
+            .await)
+    };
 
     match resp {
-        Ok(r) if r.status().as_u16() != 400 => {
+        Some(Ok(r)) if r.status().as_u16() != 400 => {
             Output::from_response(r).await
         }
         _ => {
@@ -293,7 +312,7 @@ pub async fn session_get<
 pub async fn session_post<
     Output: ResponseData<Output> + DeserializeOwned,
     Path,
-    Data: BodyData,
+    Data: BodyData + Serialize,
     PathOutput: Into<String>,
 >(
     input: SessionPostInput<'_, Path, Data>,
@@ -301,43 +320,102 @@ pub async fn session_post<
     path: fn(Path) -> PathOutput,
 ) -> SessionPostOutput<Output> {
     let session = input.session;
-    let url = format!(
-        "{}{}{}",
-        session.base_url,
-        scope,
-        path(input.path).into()
-    );
-    
-    let resp = session
-        .reqwest_client
-        .post(&url)
-        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
-        .body(input.data.create_body()?)
-        .send()
-        .await;
+    let path_str: String = path(input.path).into();
+    let url = format!("{}{}{}", session.base_url, scope, path_str);
+
+    // Serialize body once. We need the bytes both for reqwest and the curl fallback.
+    let body_bytes = serde_json::to_vec(&input.data).map_err(Error::SerdeJsonError)?;
+
+    // Honor OM_FORCE_CURL: skip the reqwest attempt entirely when set.
+    let resp = if force_curl() {
+        None
+    } else {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("path", (format!("{}{}", scope, path_str)).parse().unwrap());
+        headers.insert("Origin", "https://xnode.openmesh.network".parse().unwrap());
+        headers.insert("Referer", "https://xnode.openmesh.network/".parse().unwrap());
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        Some(session
+            .reqwest_client
+            .post(&url)
+            .headers(headers)
+            .body(Body::from(body_bytes.clone()))
+            .send()
+            .await)
+    };
 
     match resp {
-        Ok(r) if r.status().as_u16() != 400 => {
+        Some(Ok(r)) if r.status().as_u16() != 400 => {
             Output::from_response(r).await
         }
         _ => {
             // FALLBACK TO CURL
-            let mut curl = std::process::Command::new("curl");
+            //
+            // The Xnode Manager nginx proxy rejects requests from the Rust reqwest client
+            // (likely TLS fingerprint or HTTP/2 normalization). System curl gets through
+            // with a browser User-Agent, so we shell out and pipe the JSON body via stdin
+            // to avoid argv length limits and shell-escaping pitfalls.
+            let mut curl = Command::new("curl");
             curl.arg("-s").arg("-L").arg("-X").arg("POST");
             curl.arg("-H").arg(format!("Host: {}", session.domain));
-            curl.arg("-H").arg(format!("Origin: https://{}", session.domain));
+            curl.arg("-H").arg("Origin: https://xnode.openmesh.network");
+            curl.arg("-H").arg("Referer: https://xnode.openmesh.network/");
+            curl.arg("-H").arg(format!("path: {}{}", scope, path_str));
             curl.arg("-H").arg("Content-Type: application/json");
             curl.arg("-A").arg("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36");
-            
+
+            // Reuse the persisted Netscape cookie jar written by `om login`.
             let mut cookie_jar_path = Session::get_session_path()?;
             cookie_jar_path.set_extension("jar");
             if cookie_jar_path.exists() {
-                curl.arg("-b").arg(cookie_jar_path);
+                curl.arg("-b").arg(&cookie_jar_path);
             } else if !session.cookies.is_empty() {
                 curl.arg("-b").arg(session.cookies.join("; "));
             }
-            
-            Err(Error::OutputError("Post fallback not fully implemented for generic data".to_string()))
+
+            // Pipe the body via stdin: `curl --data-binary @-`
+            curl.arg("--data-binary").arg("@-");
+            curl.arg(&url);
+            curl.stdin(Stdio::piped());
+            curl.stdout(Stdio::piped());
+            curl.stderr(Stdio::piped());
+
+            let mut child = curl.spawn().map_err(|e| Error::OutputError(format!("curl spawn failed: {}", e)))?;
+            {
+                let stdin = child
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| Error::OutputError("Failed to open curl stdin".to_string()))?;
+                stdin
+                    .write_all(&body_bytes)
+                    .map_err(|e| Error::OutputError(format!("Failed to write body to curl: {}", e)))?;
+            }
+            let output = child
+                .wait_with_output()
+                .map_err(|e| Error::OutputError(format!("curl wait failed: {}", e)))?;
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+
+            if output.status.success() {
+                // Some POST endpoints return an empty body on success (e.g. file writes).
+                // Try to parse as the requested Output type, but if the body is empty and
+                // Output is `Empty`/unit-like, fall back to parsing "{}".
+                let parse_target = if stdout.trim().is_empty() { "{}" } else { stdout.as_ref() };
+                match serde_json::from_str::<Output>(parse_target) {
+                    Ok(data) => Ok(data),
+                    Err(e) => {
+                        if stdout.to_lowercase().contains("unauthorized") || stdout.to_lowercase().contains("login") {
+                            Err(Error::OutputError("Session expired or unauthorized. Please run 'om login' again.".to_string()))
+                        } else {
+                            Err(Error::OutputError(format!("Failed to parse JSON: {}. Body: {}", e, stdout)))
+                        }
+                    }
+                }
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(Error::OutputError(format!("Request failed with status {}. Stderr: {}. Body: {}", output.status, stderr, stdout)))
+            }
         }
     }
 }
