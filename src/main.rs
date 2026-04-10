@@ -10,44 +10,52 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_keccak::{Hasher, Keccak};
 use std::fs;
 
-mod sdk;
-use crate::sdk::utils::Session;
+use om::cli::cmd::{app, req};
+use om::cli::error::report;
+use om::cli::output::OutputFormat;
+use om::sdk;
+use om::sdk::utils::Session;
 
 #[derive(Parser)]
 #[command(name = "om")]
 #[command(about = "Openmesh CLI: The Sovereign Node Orchestrator", long_about = None)]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 
     /// Target XNODE server URL or IP (e.g., https://manager.yourdomain.com)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     url: Option<String>,
+
+    /// Output format. Use `json` for scripts and AI agents.
+    #[arg(short, long, global = true, value_enum, default_value_t = OutputFormat::Plain)]
+    format: OutputFormat,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Manage your EVM wallet
+    /// Manage your EVM wallet (import / status / clear)
     Wallet {
         #[command(subcommand)]
         action: WalletAction,
     },
     /// Authenticate with the Sovereign Node
     Login,
-    /// Node information and monitoring
+    /// Node information and monitoring (info / status)
     Node {
         #[command(subcommand)]
         action: NodeAction,
     },
-    /// Manage Apps on your Xnode
+    /// Manage applications on your Xnode (list / deploy / expose / remove)
     App {
         #[command(subcommand)]
-        action: AppAction,
+        action: app::AppAction,
     },
-    /// Host-level operations (NixOS)
-    Host {
+    /// Inspect or wait on async requests (show / wait)
+    Req {
         #[command(subcommand)]
-        action: HostAction,
+        action: req::ReqAction,
     },
     /// Manage running processes and containers
     Ps,
@@ -59,39 +67,6 @@ enum NodeAction {
     Info,
     /// Monitor real-time resource usage (CPU, RAM, Disk)
     Status,
-}
-
-#[derive(Subcommand)]
-enum AppAction {
-    /// List all installed applications
-    List,
-    /// Deploy a new app (standard or custom flake)
-    Deploy {
-        #[arg(short, long)]
-        name: String,
-        #[arg(short, long)]
-        template: Option<String>,
-    },
-    /// Update an existing app configuration
-    Update { name: String },
-    /// Remove an app from the node
-    Delete { name: String },
-    /// Explore app files
-    Files { name: String },
-}
-
-#[derive(Subcommand)]
-enum HostAction {
-    /// List all system processes
-    Ps,
-    /// Browse host file system
-    Explorer,
-    /// Edit the main OS Flake configuration
-    Edit,
-    /// Trigger a NixOS rebuild/switch
-    Update,
-    /// Reboot the Sovereign Node
-    Reboot,
 }
 
 #[derive(Subcommand)]
@@ -149,7 +124,30 @@ fn to_checksum_address(addr: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    
+    let format = cli.format;
+
+    // Dispatch new-style commands (those built on cli::cmd::*) first.
+    // These take ownership of their action via destructuring; legacy
+    // handlers below borrow cli.command.
+    //
+    // We do this by destructuring `cli.command` once, then re-binding
+    // any non-new-style variant back into `cli` via a fall-through.
+    let cli = match cli {
+        Cli { command: Commands::App { action }, .. } => {
+            if let Err(e) = app::run(action, format).await {
+                std::process::exit(report(&e, format));
+            }
+            return Ok(());
+        }
+        Cli { command: Commands::Req { action }, .. } => {
+            if let Err(e) = req::run(action, format).await {
+                std::process::exit(report(&e, format));
+            }
+            return Ok(());
+        }
+        other => other,
+    };
+
     match &cli.command {
         Commands::Wallet { action } => match action {
             WalletAction::Import => {
@@ -409,7 +407,8 @@ async fn main() -> Result<()> {
                 Err(e) => eprintln!("❌ Error listing containers: {:?}", e),
             }
         }
-        _ => println!("🚧 Command not yet fully bridged to SDK. Check back soon!"),
+        // App and Req are handled in the early dispatcher above.
+        Commands::App { .. } | Commands::Req { .. } => unreachable!(),
     }
 
     Ok(())

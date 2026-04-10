@@ -24,6 +24,10 @@ futures = "0.3"
 dirs-next = "2.0"
 url = "2.5"
 
+[lib]
+name = "om"
+path = "src/lib.rs"
+
 [[bin]]
 name = "om"
 path = "src/main.rs"
@@ -31,3 +35,7 @@ path = "src/main.rs"
 [[test]]
 name = "test_suite"
 path = "tests/test_suite.rs"
+
+[[test]]
+name = "test_flake_editor"
+path = "tests/test_flake_editor.rs"
