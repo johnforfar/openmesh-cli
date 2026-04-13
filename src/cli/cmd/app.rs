@@ -279,6 +279,111 @@ impl Renderable for AppInfoView {
 // deploy / remove
 // =============================================================================
 
+/// Derive a sane nix flake input name from a flake URI.
+///
+/// Examples:
+///   github:johnforfar/openmesh-support-agent          → "openmesh-support-agent"
+///   github:Openmesh-Network/xnode-apps?dir=jellyfin   → "jellyfin"
+///   github:user/my.repo                                → "my-repo"
+///
+/// Nix flake input names must be valid attribute names. We force lowercase,
+/// allow [a-z0-9_-], and replace anything else with `-`.
+fn derive_input_name(uri: &str) -> String {
+    // Prefer the `?dir=...` segment if present (xnode-apps style)
+    let raw = if let Some(idx) = uri.find("?dir=") {
+        let after = &uri[idx + 5..];
+        after.split('&').next().unwrap_or(after).rsplit('/').next().unwrap_or(after)
+    } else {
+        // Otherwise: the last `/`-separated segment
+        let stripped = uri
+            .rsplit('/')
+            .next()
+            .unwrap_or(uri);
+        // Drop ?ref=... suffix if present
+        stripped.split('?').next().unwrap_or(stripped)
+    };
+    let cleaned: String = raw
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let trimmed = cleaned.trim_matches('-').to_string();
+    if trimmed.is_empty() { "app".to_string() } else { trimmed }
+}
+
+/// Wrap a flake URI into a full flake.nix expression that the xnode-manager
+/// can build directly.
+///
+/// The xnode-manager's `config.set` API takes the `flake` field as the
+/// **full text** of `flake.nix`, not as a flake URI. The backend at
+/// `xnode-manager/rust-app/src/config/handlers.rs:158` writes the string
+/// verbatim into `/var/lib/xnode-manager/containers/<name>/flake.nix`.
+///
+/// The wrapper:
+///   1. declares `xnode-manager` as a flake input (mandatory — provides
+///      `nixosModules.container`)
+///   2. declares the user's flake as an input under a generated name
+///   3. **follows xnode-manager's pinned nixpkgs** — see Lesson #2.
+///   4. **enables DHCP** so the container registers with host dnsmasq
+///      and `<name>.container` DNS resolves — see Lesson #6. Without
+///      this, every exposed URL 502s.
+///   5. composes them into `nixosConfigurations.container`
+///
+/// The user's flake MUST export `nixosModules.default`, matching the
+/// `xnode-apps/*` convention.
+///
+/// See `openxai-studio/lib/xnode.ts:75-143` for the canonical pattern.
+/// See `openmesh-cli/ENGINEERING/PIPELINE-LESSONS.md` Lessons #1, #2, #6.
+fn wrap_uri_into_flake_expr(uri: &str) -> String {
+    let input_name = derive_input_name(uri);
+    format!(
+        r#"{{
+  inputs = {{
+    xnode-manager.url = "github:Openmesh-Network/xnode-manager";
+    # We pull openclaw's flake purely to follow its nixpkgs pin, which is
+    # the version that's known-working for nixos-containers (dhcpcd starts
+    # automatically, mDNS publishes correctly). xnode-manager's pinned
+    # nixpkgs and bleeding-edge unstable both fail to start dhcpcd.
+    # See PIPELINE-LESSONS.md Lesson #6 + #8.
+    openclaw.url = "github:openclaw/nix-openclaw";
+    {input_name}.url = "{uri}";
+    nixpkgs.follows = "openclaw/nixpkgs";
+  }};
+
+  outputs = inputs: {{
+    nixosConfigurations.container = inputs.nixpkgs.lib.nixosSystem {{
+      specialArgs = {{ inherit inputs; }};
+      modules = [
+        inputs.xnode-manager.nixosModules.container
+        {{
+          services.xnode-container.xnode-config = {{
+            host-platform = ./xnode-config/host-platform;
+            state-version = ./xnode-config/state-version;
+            hostname = ./xnode-config/hostname;
+          }};
+          # CRITICAL: DHCP is required so the container registers its
+          # hostname with the host's dnsmasq. Without this, the host
+          # nginx cannot resolve the container by name. The systemd
+          # override forces dhcpcd to start (the standard
+          # `networking.dhcpcd.enable` option doesn't actually start
+          # the service in nixos-containers; we have to force it).
+          # See PIPELINE-LESSONS.md Lesson #6.
+          networking.useDHCP = true;
+          networking.dhcpcd.enable = true;
+          systemd.services.dhcpcd.wantedBy = [ "multi-user.target" ];
+          systemd.services.dhcpcd.enable = true;
+        }}
+        inputs.{input_name}.nixosModules.default
+      ];
+    }};
+  }};
+}}
+"#,
+        input_name = input_name,
+        uri = uri,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn deploy(
     session: &sdk::utils::Session,
@@ -292,10 +397,30 @@ async fn deploy(
 ) -> CliResult<()> {
     validate_container_name(&name)?;
 
+    // The `--flake` arg accepts either:
+    //   (a) a flake URI like `github:owner/repo` or `github:owner/repo?dir=foo`
+    //       — we wrap it into a full flake.nix expression
+    //   (b) a literal flake.nix expression starting with `{` (advanced)
+    //       — we send it as-is
+    let flake_expr = if flake.trim_start().starts_with('{') {
+        flake.clone()
+    } else {
+        wrap_uri_into_flake_expr(&flake)
+    };
+
+    // CRITICAL: `network: Some("containernet")` attaches the container to
+    // the host's `vz-*` bridge via systemd-nspawn's `--network-zone` flag.
+    // WITHOUT THIS, the container has no network interface bridged to the
+    // host at all — DHCP can't run, mDNS can't publish, and the host
+    // reverse proxy can't reach the container at any hostname or IP.
+    //
+    // openclaw on Johnny's xnode has `network: "containernet"` and is
+    // reachable; my earlier deploys had `network: None` and were not.
+    // See PIPELINE-LESSONS.md Lesson #8 for the bug story.
     let change = sdk::config::ContainerChange {
         settings: sdk::config::ContainerSettings {
-            flake: flake.clone(),
-            network: None,
+            flake: flake_expr.clone(),
+            network: Some("containernet".to_string()),
             nvidia_gpus: None,
         },
         update_inputs: if update_input.is_empty() { None } else { Some(update_input) },
@@ -435,6 +560,20 @@ async fn expose(
     let current_flake = os.flake.clone();
 
     // Build the new expose rule.
+    //
+    // The forward target uses the **bare container name** with no DNS
+    // suffix. This is what the host's dnsmasq resolves to the container's
+    // DHCP-allocated IP, after the container has registered its hostname
+    // via DHCP from the vz-* bridge. The container needs DHCP enabled
+    // (handled by the wrapper from Lesson #6) for this to resolve.
+    //
+    // Note: `.container` and `.local` were both tried and don't work
+    // for host→container forwarding. The first is stale upstream
+    // documentation; the second is the mDNS suffix that works for
+    // container→container glibc lookups but NOT for nginx upstream
+    // resolution which goes via dnsmasq.
+    //
+    // See ENGINEERING/PIPELINE-LESSONS.md Lessons #3, #6, and #7.
     let forward = format!("{}://{}:{}", protocol.as_str(), name, port);
     let expose_rule = DomainExpose {
         domain: domain.clone(),
@@ -679,5 +818,127 @@ mod tests {
         assert_eq!(ForwardProto::Https.as_str(), "https");
         assert_eq!(ForwardProto::Tcp.as_str(), "tcp");
         assert_eq!(ForwardProto::Udp.as_str(), "udp");
+    }
+
+    #[test]
+    fn derive_input_name_from_simple_github_uri() {
+        assert_eq!(
+            derive_input_name("github:johnforfar/openmesh-support-agent"),
+            "openmesh-support-agent"
+        );
+    }
+
+    #[test]
+    fn derive_input_name_from_xnode_apps_dir_uri() {
+        assert_eq!(
+            derive_input_name("github:Openmesh-Network/xnode-apps?dir=jellyfin"),
+            "jellyfin"
+        );
+    }
+
+    #[test]
+    fn derive_input_name_strips_ref_query() {
+        assert_eq!(
+            derive_input_name("github:user/myrepo?ref=v1.0.0"),
+            "myrepo"
+        );
+    }
+
+    #[test]
+    fn derive_input_name_lowercases_and_sanitizes() {
+        assert_eq!(
+            derive_input_name("github:UPPERCASE/My.Weird-Name"),
+            "my-weird-name"
+        );
+    }
+
+    #[test]
+    fn wrap_uri_produces_valid_nix_attrset_with_required_fields() {
+        let wrapped = wrap_uri_into_flake_expr("github:johnforfar/openmesh-support-agent");
+        // Top-level must be `{` ... `}`
+        assert!(wrapped.trim_start().starts_with('{'));
+        assert!(wrapped.trim_end().ends_with('}'));
+        // Must declare xnode-manager input (mandatory per the manager)
+        assert!(wrapped.contains("xnode-manager.url"));
+        // Must reference the user's flake
+        assert!(wrapped.contains("github:johnforfar/openmesh-support-agent"));
+        // Must produce nixosConfigurations.container (what the manager builds)
+        assert!(wrapped.contains("nixosConfigurations.container"));
+        // Must reference the user's flake's nixosModules.default
+        assert!(wrapped.contains(".nixosModules.default"));
+        // Must include the xnode-config module wiring
+        assert!(wrapped.contains("xnode-container.xnode-config"));
+    }
+
+    #[test]
+    fn wrap_uri_uses_derived_input_name_consistently() {
+        let wrapped = wrap_uri_into_flake_expr("github:Openmesh-Network/xnode-apps?dir=ollama");
+        // The input name "ollama" should appear in: input declaration AND
+        // the modules list reference. (No longer in nixpkgs.follows after
+        // Lesson #2 fix — that now follows xnode-manager.)
+        assert!(wrapped.contains("ollama.url"));
+        assert!(wrapped.contains("inputs.ollama.nixosModules.default"));
+    }
+
+    #[test]
+    fn forward_url_format_uses_bare_hostname_for_dnsmasq() {
+        // After trying .container (Lesson #3) and .local (Lesson #7),
+        // the actual working pattern is the bare container hostname.
+        // The host's dnsmasq resolves it via DHCP registration once the
+        // container DHCPs from the vz-* bridge.
+        // See PIPELINE-LESSONS.md Lessons #3, #6, #7.
+        let name = "support-agent";
+        let port = 8080u16;
+        let protocol = ForwardProto::Http;
+        let forward = format!("{}://{}:{}", protocol.as_str(), name, port);
+        assert_eq!(forward, "http://support-agent:8080");
+    }
+
+    #[test]
+    fn wrap_uri_includes_dhcp_for_container_dns_resolution() {
+        // PIPELINE-LESSONS.md Lesson #6: the wrapper MUST enable DHCP so the
+        // container registers its hostname with the host's dnsmasq. Without
+        // this, host nginx cannot resolve `<name>.container` and every
+        // exposed URL returns 502.
+        let wrapped = wrap_uri_into_flake_expr("github:johnforfar/openmesh-support-agent");
+        assert!(
+            wrapped.contains("networking.dhcpcd.enable = true"),
+            "wrapper must enable dhcpcd (Lesson #6)"
+        );
+        assert!(
+            wrapped.contains("networking.useDHCP = true"),
+            "wrapper must enable networking.useDHCP (Lesson #6)"
+        );
+    }
+
+    #[test]
+    fn wrap_uri_follows_openclaw_nixpkgs() {
+        // PIPELINE-LESSONS.md Lesson #9: the wrapper MUST follow
+        // openclaw/nixpkgs because that is the version known to start
+        // dhcpcd correctly inside an xnode-manager nixos-container.
+        // xnode-manager/nixpkgs and bleeding-edge unstable both fail to
+        // start dhcpcd, which means host dnsmasq never learns the
+        // container hostname, which means the public URL returns 502.
+        //
+        // (This test was originally written for Lesson #2 which asserted
+        // xnode-manager/nixpkgs. Lesson #9 inverted that finding after
+        // the openmesh-hello-world deploy proved which baseline actually
+        // works end-to-end against the live xnode.)
+        let wrapped = wrap_uri_into_flake_expr("github:johnforfar/openmesh-hello-world");
+        assert!(
+            wrapped.contains(r#"nixpkgs.follows = "openclaw/nixpkgs""#),
+            "wrapper must follow openclaw/nixpkgs (Lesson #9)"
+        );
+        assert!(
+            wrapped.contains(r#"openclaw.url = "github:openclaw/nix-openclaw""#),
+            "wrapper must declare the openclaw input so the follows resolves"
+        );
+        // Negative: must NOT follow the user's nixpkgs (newer nixpkgs
+        // breaks xnode-manager's container module — Lesson #2 finding
+        // is still valid).
+        assert!(
+            !wrapped.contains(r#"nixpkgs.follows = "openmesh-hello-world/nixpkgs""#),
+            "wrapper must not follow the user's nixpkgs"
+        );
     }
 }

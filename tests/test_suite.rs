@@ -5,7 +5,7 @@
 //!   2. Session tests  — load/validate the persisted session file
 //!   3. Live API tests — hit the real Xnode Manager via the reqwest path
 //!                       (gracefully degrade on 400 — see Fix #1 in
-//!                       OPEN-SOURCE-FIXES.md)
+//!                       ENGINEERING/ISSUES.md (local))
 //!   4. Curl-based live tests — same endpoints via the SDK's curl fallback;
 //!                              currently the only path that works against
 //!                              `manager.build.openmesh.cloud`
@@ -18,7 +18,7 @@
 //! (`0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266`) derived from the open
 //! mnemonic "test test test test test test test test test test test junk".
 //! No personal wallet addresses are hardcoded in this file — see
-//! OPEN-SOURCE-FIXES.md for the rationale.
+//! ENGINEERING/ISSUES.md (local) for the rationale.
 
 use tiny_keccak::{Hasher, Keccak};
 use k256::ecdsa::{SigningKey, VerifyingKey};
@@ -113,7 +113,7 @@ async fn api_get(client: &reqwest::Client, base_url: &str, scope: &str, path: &s
 }
 
 /// Curl-based GET. The Xnode Manager nginx proxy rejects reqwest requests
-/// (Host/SNI conflict, cookie serialization mismatch — see OPEN-SOURCE-FIXES.md
+/// (Host/SNI conflict, cookie serialization mismatch — see ENGINEERING/ISSUES.md (local)
 /// Fix #1) but accepts curl with the netscape-format cookie jar. This matches
 /// the SDK's `session_get` fallback.
 fn curl_get(base_url: &str, domain: &str, scope: &str, path: &str) -> Result<serde_json::Value, String> {
@@ -388,7 +388,7 @@ fn session_cookie_jar_exists() {
 
 // ---------------------------------------------------------------------------
 // 3. LIVE API TESTS — Hit the real Xnode Manager via reqwest
-//    (Currently expected to return 400 from nginx — see OPEN-SOURCE-FIXES.md
+//    (Currently expected to return 400 from nginx — see ENGINEERING/ISSUES.md (local)
 //    Fix #1. These tests gracefully degrade so the suite still passes.)
 // ---------------------------------------------------------------------------
 
@@ -417,7 +417,7 @@ async fn live_usage_memory() {
         assert!(body.get("used").is_some());
         assert!(body.get("total").is_some());
     } else {
-        eprintln!("  WARN: {} (expected — see OPEN-SOURCE-FIXES.md Fix #1)", status);
+        eprintln!("  WARN: {} (expected — see ENGINEERING/ISSUES.md (local) Fix #1)", status);
     }
 }
 
