@@ -9,4 +9,5 @@
 //! dispatching to the right `run` function.
 
 pub mod app;
+pub mod os;
 pub mod req;

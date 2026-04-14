@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_keccak::{Hasher, Keccak};
 use std::fs;
 
-use om::cli::cmd::{app, req};
+use om::cli::cmd::{app, os, req};
 use om::cli::error::report;
 use om::cli::output::OutputFormat;
 use om::sdk;
@@ -51,6 +51,11 @@ enum Commands {
     App {
         #[command(subcommand)]
         action: app::AppAction,
+    },
+    /// Manage the host OS configuration of your Xnode (github-auth)
+    Os {
+        #[command(subcommand)]
+        action: os::OsAction,
     },
     /// Inspect or wait on async requests (show / wait)
     Req {
@@ -135,6 +140,12 @@ async fn main() -> Result<()> {
     let cli = match cli {
         Cli { command: Commands::App { action }, .. } => {
             if let Err(e) = app::run(action, format).await {
+                std::process::exit(report(&e, format));
+            }
+            return Ok(());
+        }
+        Cli { command: Commands::Os { action }, .. } => {
+            if let Err(e) = os::run(action, format).await {
                 std::process::exit(report(&e, format));
             }
             return Ok(());
@@ -408,7 +419,7 @@ async fn main() -> Result<()> {
             }
         }
         // App and Req are handled in the early dispatcher above.
-        Commands::App { .. } | Commands::Req { .. } => unreachable!(),
+        Commands::App { .. } | Commands::Os { .. } | Commands::Req { .. } => unreachable!(),
     }
 
     Ok(())
