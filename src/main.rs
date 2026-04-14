@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_keccak::{Hasher, Keccak};
 use std::fs;
 
-use om::cli::cmd::{app, os, req};
+use om::cli::cmd::{app, os, req, status};
 use om::cli::error::report;
 use om::cli::output::OutputFormat;
 use om::sdk;
@@ -64,6 +64,18 @@ enum Commands {
     },
     /// Manage running processes and containers
     Ps,
+    /// Show a dashboard banner with xnode specs, CPU/mem/disk utilisation, and container list
+    Status {
+        /// Re-render every `interval` seconds until Ctrl-C
+        #[arg(long)]
+        watch: bool,
+        /// Watch interval in seconds
+        #[arg(long, default_value_t = 3)]
+        interval: u64,
+        /// Disable ANSI colour output (auto-disabled when stdout isn't a tty)
+        #[arg(long)]
+        no_color: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -152,6 +164,12 @@ async fn main() -> Result<()> {
         }
         Cli { command: Commands::Req { action }, .. } => {
             if let Err(e) = req::run(action, format).await {
+                std::process::exit(report(&e, format));
+            }
+            return Ok(());
+        }
+        Cli { command: Commands::Status { watch, interval, no_color }, .. } => {
+            if let Err(e) = status::run(watch, interval, no_color, format).await {
                 std::process::exit(report(&e, format));
             }
             return Ok(());
@@ -419,7 +437,7 @@ async fn main() -> Result<()> {
             }
         }
         // App and Req are handled in the early dispatcher above.
-        Commands::App { .. } | Commands::Os { .. } | Commands::Req { .. } => unreachable!(),
+        Commands::App { .. } | Commands::Os { .. } | Commands::Req { .. } | Commands::Status { .. } => unreachable!(),
     }
 
     Ok(())
