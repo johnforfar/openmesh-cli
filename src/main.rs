@@ -11,6 +11,7 @@ use tiny_keccak::{Hasher, Keccak};
 use std::fs;
 
 use om::cli::cmd::{app, os, req, status};
+use om::cli::context::set_active_profile;
 use om::cli::error::report;
 use om::cli::output::OutputFormat;
 use om::sdk;
@@ -28,8 +29,12 @@ struct Cli {
     #[arg(short, long, global = true)]
     url: Option<String>,
 
+    /// Named profile to use (e.g., hermes, v10). Overrides the default profile.
+    #[arg(short, long, global = true)]
+    profile: Option<String>,
+
     /// Output format. Use `json` for scripts and AI agents.
-    #[arg(short, long, global = true, value_enum, default_value_t = OutputFormat::Plain)]
+    #[arg(short = 'f', long, global = true, value_enum, default_value_t = OutputFormat::Plain)]
     format: OutputFormat,
 }
 
@@ -62,6 +67,11 @@ enum Commands {
         #[command(subcommand)]
         action: req::ReqAction,
     },
+    /// Manage named Xnode profiles (list / use / login / remove)
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
     /// Manage running processes and containers
     Ps,
     /// Show a dashboard banner with xnode specs, CPU/mem/disk utilisation, and container list
@@ -84,6 +94,34 @@ enum NodeAction {
     Info,
     /// Monitor real-time resource usage (CPU, RAM, Disk)
     Status,
+}
+
+#[derive(Subcommand)]
+enum ProfileAction {
+    /// List all saved Xnode profiles.
+    List,
+    /// Set the default profile for all commands.
+    Use {
+        /// Profile name to set as default.
+        name: String,
+    },
+    /// Authenticate and save a named profile.
+    Login {
+        /// Profile name (e.g., hermes, v10).
+        name: String,
+        /// Xnode Manager URL (e.g., https://manager.yourdomain.com or https://74.50.126.86).
+        #[arg(short, long)]
+        url: String,
+        /// Override the Host header and auth domain (for IP-only xnodes).
+        /// Use "manager.xnode.local" to bootstrap domain assignment on a fresh xnode.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Remove a saved profile.
+    Remove {
+        /// Profile name to remove.
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -143,6 +181,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = cli.format;
 
+    // Set the active profile for all downstream Session::load() calls.
+    set_active_profile(cli.profile.clone());
+
     // Dispatch new-style commands (those built on cli::cmd::*) first.
     // These take ownership of their action via destructuring; legacy
     // handlers below borrow cli.command.
@@ -178,6 +219,155 @@ async fn main() -> Result<()> {
     };
 
     match &cli.command {
+        Commands::Profile { action } => match action {
+            ProfileAction::List => {
+                let profiles = Session::list_profiles()?;
+                let default = Session::get_default_profile().ok().flatten();
+                if profiles.is_empty() {
+                    println!("No profiles saved. Run: om profile login <name> -u <URL>");
+                    // Check legacy session
+                    if Session::get_session_path()?.exists() {
+                        println!("  (legacy session found at ~/.openmesh_session.cookie)");
+                    }
+                } else {
+                    println!("Saved profiles:");
+                    for name in &profiles {
+                        let marker = if default.as_deref() == Some(name) { " (default)" } else { "" };
+                        if let Ok(session) = Session::load_profile(name) {
+                            println!("  {} → {}{}", name, session.base_url, marker);
+                        } else {
+                            println!("  {} → (invalid){}", name, marker);
+                        }
+                    }
+                }
+            }
+            ProfileAction::Use { name } => {
+                // Verify the profile exists
+                let _ = Session::load_profile(name)
+                    .map_err(|_| anyhow!("Profile '{}' not found. Run: om profile login {} -u <URL>", name, name))?;
+                Session::set_default_profile(name)
+                    .map_err(|e| anyhow!("Failed to set default: {:?}", e))?;
+                println!("Default profile set to '{}'", name);
+            }
+            ProfileAction::Login { name, url, host } => {
+                // Reuse the login flow from Commands::Login but save to a named profile
+                println!("Authenticating profile '{}' with {}...", name, url);
+
+                let entry = Entry::new(APP_NAME, KEY_ACCOUNT)
+                    .map_err(|e| anyhow!("Keychain error: {}", e))?;
+                let pk_hex = entry.get_password()
+                    .map_err(|_| anyhow!("No wallet found. Run 'om wallet import' first."))?;
+
+                let bytes = hex::decode(&pk_hex)?;
+                let signing_key = SigningKey::from_bytes(bytes.as_slice().into())?;
+                let public_key = VerifyingKey::from(&signing_key);
+                let address = public_key_to_address(&public_key);
+                println!("  Using Wallet: {}", address);
+
+                let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs().to_string();
+                let url_parsed = url::Url::parse(url)
+                    .map_err(|e| anyhow!("Invalid URL: {}", e))?;
+                // Use host override for domain signing if provided (for IP-only xnodes)
+                let actual_host = url_parsed.host_str()
+                    .ok_or_else(|| anyhow!("No host in URL"))?;
+                let domain = host.as_deref().unwrap_or(actual_host);
+                let origin = format!("https://{}", domain);
+                if host.is_some() {
+                    println!("  Host override: {}", domain);
+                }
+
+                let user_addr_plain = address.trim_start_matches("0x").to_lowercase();
+                let user_addr_prefixed = format!("eth:{}", user_addr_plain);
+                let message = format!("Xnode Auth authenticate {} at {}", domain, timestamp);
+
+                let eth_prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
+                let mut eth_message = eth_prefix.into_bytes();
+                eth_message.extend_from_slice(message.as_bytes());
+
+                let mut hasher = Keccak::v256();
+                let mut hash = [0u8; 32];
+                hasher.update(&eth_message);
+                hasher.finalize(&mut hash);
+
+                let (signature_bytes, recovery_id) = signing_key.sign_prehash_recoverable(&hash)
+                    .map_err(|e| anyhow!("Signing failed: {}", e))?;
+                let mut full_sig = signature_bytes.to_bytes().to_vec();
+                full_sig.push(recovery_id.to_byte() + 27);
+                let signature = format!("0x{}", hex::encode(full_sig));
+
+                let login_url = format!("{}/xnode-auth/api/login", url);
+                let login_payload = serde_json::json!({
+                    "user": user_addr_prefixed,
+                    "signature": signature,
+                    "timestamp": timestamp
+                });
+
+                // Use curl fallback directly (most reliable)
+                let cookie_file = format!("/tmp/om_profile_{}.txt", name);
+                let _ = fs::remove_file(&cookie_file);
+                let _ = std::process::Command::new("curl")
+                    .arg("-s").arg("-L").arg("-k")
+                    .arg("-c").arg(&cookie_file)
+                    .arg("-X").arg("POST")
+                    .arg(&login_url)
+                    .arg("-H").arg("Content-Type: application/json")
+                    .arg("-H").arg(format!("Origin: {}", origin))
+                    .arg("-H").arg(format!("Host: {}", domain))
+                    .arg("-H").arg(format!("Referer: {}/xnode-auth", origin))
+                    .arg("-A").arg("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
+                    .arg("-d").arg(serde_json::to_string(&login_payload)?)
+                    .output()?;
+
+                let mut session_cookies = Vec::new();
+                if fs::metadata(&cookie_file).is_ok() {
+                    let cookie_data = fs::read_to_string(&cookie_file)?;
+                    for line in cookie_data.lines() {
+                        if line.trim().is_empty() || line.starts_with("# ") { continue; }
+                        let parts: Vec<&str> = line.split('\t').collect();
+                        if parts.len() >= 7 {
+                            session_cookies.push(format!("{}={}", parts[5], parts[6]));
+                        }
+                    }
+                }
+
+                let success = session_cookies.iter().any(|c| c.contains("xnode_auth_signature"));
+                if success && !session_cookies.is_empty() {
+                    let client = reqwest::Client::builder()
+                        .danger_accept_invalid_certs(true)
+                        .build()?;
+                    let session = Session {
+                        reqwest_client: client,
+                        base_url: url.clone(),
+                        domain: domain.to_string(),
+                        cookies: session_cookies,
+                        host_override: host.clone(),
+                    };
+                    // Save to named profile
+                    session.save_profile(name)
+                        .map_err(|e| anyhow!("Failed to save profile: {:?}", e))?;
+                    // Also save legacy session for backward compat
+                    session.save()
+                        .map_err(|e| anyhow!("Failed to save legacy session: {:?}", e))?;
+                    // Set as default if it's the first profile
+                    let profiles = Session::list_profiles()?;
+                    if profiles.len() <= 1 || Session::get_default_profile()?.is_none() {
+                        Session::set_default_profile(name)?;
+                    }
+                    println!("Profile '{}' saved and authenticated.", name);
+                    println!("  URL: {}", url);
+                    if Session::get_default_profile()?.as_deref() == Some(name) {
+                        println!("  (set as default)");
+                    }
+                } else {
+                    return Err(anyhow!("Authentication failed for profile '{}'", name));
+                }
+            }
+            ProfileAction::Remove { name } => {
+                Session::delete_profile(name)
+                    .map_err(|e| anyhow!("Failed to remove profile: {:?}", e))?;
+                println!("Profile '{}' removed.", name);
+            }
+        },
         Commands::Wallet { action } => match action {
             WalletAction::Import => {
                 println!("Import your identity to your local secure keychain.");
@@ -360,6 +550,7 @@ async fn main() -> Result<()> {
                     reqwest_client: client,
                     base_url: target_url,
                     domain: domain.to_string(),
+                    host_override: None,
                     cookies: session_cookies,
                 };
                 session.save().map_err(|e| anyhow!("Failed to save session: {:?}", e))?;
@@ -375,7 +566,7 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Node { action } => {
-            let session = Session::load().map_err(|_| anyhow!("Not logged in. Run 'om login' first."))?;
+            let session = om::cli::context::require_session().map_err(|e| anyhow!("{}", e))?;
             match action {
                 NodeAction::Info => {
                     println!("📡 Fetching node configuration from {}...", session.base_url);
@@ -423,7 +614,7 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Ps => {
-            let session = Session::load().map_err(|_| anyhow!("Not logged in. Run 'om login' first."))?;
+            let session = om::cli::context::require_session().map_err(|e| anyhow!("{}", e))?;
             println!("📋 Listing processes/containers...");
             let input = sdk::config::ContainersInput::new(&session);
             match sdk::config::containers(input).await {

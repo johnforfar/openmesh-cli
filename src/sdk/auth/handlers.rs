@@ -58,6 +58,7 @@ pub async fn login(input: LoginInput) -> LoginOutput {
         base_url: input.base_url,
         domain,
         cookies: vec![],
+        host_override: None,
     })
 }
 

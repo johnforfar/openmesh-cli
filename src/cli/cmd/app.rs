@@ -128,6 +128,20 @@ pub enum AppAction {
         dry_run: bool,
     },
 
+    /// Show journal logs from a container's processes.
+    Logs {
+        /// The container name.
+        name: String,
+
+        /// Maximum number of log entries to return.
+        #[arg(long, default_value_t = 100)]
+        max: u32,
+
+        /// Filter by log level (error, warn, info).
+        #[arg(long)]
+        level: Option<String>,
+    },
+
     /// Remove a reverse-proxy rule for a subdomain.
     Unexpose {
         /// FQDN to remove, e.g. `demo.build.openmesh.cloud`.
@@ -206,6 +220,9 @@ pub async fn run(action: AppAction, format: OutputFormat) -> CliResult<()> {
             timeout,
             dry_run,
         } => unexpose(&session, domain, wait, timeout, dry_run, format).await,
+        AppAction::Logs { name, max, level } => {
+            app_logs(&session, name, max, level, format).await
+        }
     }
 }
 
@@ -789,6 +806,95 @@ fn status_of(info: &sdk::request::RequestInfo) -> String {
         Some(sdk::request::RequestIdResult::Success { .. }) => "success".into(),
         Some(sdk::request::RequestIdResult::Error { error }) => format!("error: {}", error),
     }
+}
+
+// =============================================================================
+// logs
+// =============================================================================
+
+async fn app_logs(
+    session: &sdk::utils::Session,
+    name: String,
+    max: u32,
+    level: Option<String>,
+    _format: OutputFormat,
+) -> CliResult<()> {
+    let scope = format!("container:{}", name);
+
+    let log_level = level.as_deref().map(|l| match l.to_lowercase().as_str() {
+        "error" => sdk::process::LogLevel::Error,
+        "warn" => sdk::process::LogLevel::Warn,
+        "info" => sdk::process::LogLevel::Info,
+        _ => sdk::process::LogLevel::Unknown,
+    });
+
+    let query = sdk::process::LogQuery {
+        max: Some(max),
+        level: log_level,
+    };
+
+    let list_input = sdk::process::ListInput::new_with_path(
+        session,
+        sdk::process::ListPath { scope: scope.clone() },
+    );
+    let processes = sdk::process::list(list_input).await;
+
+    match processes {
+        Ok(procs) => {
+            let mut out = std::io::stdout();
+            writeln!(out, "Logs for container `{}`", name)?;
+            writeln!(out)?;
+
+            if procs.is_empty() {
+                writeln!(out, "  (no processes found)")?;
+            }
+
+            for proc in &procs {
+                let logs_input = sdk::process::LogsInput {
+                    session,
+                    path: sdk::process::LogsPath {
+                        scope: scope.clone(),
+                        process: proc.name.clone(),
+                    },
+                    query: query.clone(),
+                };
+                writeln!(out, "--- {} ({}) ---", proc.name, if proc.running { "running" } else { "stopped" })?;
+                match sdk::process::logs(logs_input).await {
+                    Ok(logs) => {
+                        if logs.is_empty() {
+                            writeln!(out, "  (no logs)")?;
+                        }
+                        for log in &logs {
+                            let msg = match &log.message {
+                                sdk::utils::Output::UTF8 { output } => output.clone(),
+                                sdk::utils::Output::Bytes { output } => {
+                                    String::from_utf8_lossy(output).to_string()
+                                }
+                            };
+                            let lvl = match &log.level {
+                                sdk::process::LogLevel::Error => "ERR",
+                                sdk::process::LogLevel::Warn => "WRN",
+                                sdk::process::LogLevel::Info => "INF",
+                                sdk::process::LogLevel::Unknown => "???",
+                            };
+                            writeln!(out, "  [{}] {}", lvl, msg)?;
+                        }
+                    }
+                    Err(e) => {
+                        writeln!(out, "  [error fetching logs: {}]", e)?;
+                    }
+                }
+                writeln!(out)?;
+            }
+        }
+        Err(e) => {
+            let mut out = std::io::stderr();
+            writeln!(out, "Could not list processes for container `{}`: {}", name, e)?;
+            writeln!(out, "The container may not be running.")?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

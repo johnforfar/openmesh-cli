@@ -30,41 +30,137 @@ pub struct Session {
     pub base_url: String,
     pub domain: String,
     pub cookies: Vec<String>,
+    /// Set when domain differs from the URL host (IP-only xnodes).
+    pub host_override: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PersistedSession {
     pub url: String,
     pub cookies: Vec<String>,
+    /// Optional host override for IP-only xnodes. When set, this is used
+    /// as the Host header and auth domain instead of extracting from url.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_override: Option<String>,
 }
 
 impl Session {
+    // ─── Profile directory ─────────────────────────────────────────
+
+    /// Returns `~/.openmesh/profiles/`
+    fn profiles_dir() -> Result<PathBuf, Error> {
+        let mut dir = dirs_next::home_dir()
+            .ok_or_else(|| Error::OutputError("Could not find home directory".to_string()))?;
+        dir.push(".openmesh");
+        dir.push("profiles");
+        Ok(dir)
+    }
+
+    /// Returns the path for a named profile: `~/.openmesh/profiles/<name>.json`
+    fn profile_path(name: &str) -> Result<PathBuf, Error> {
+        let mut path = Self::profiles_dir()?;
+        path.push(format!("{}.json", name));
+        Ok(path)
+    }
+
+    /// Returns `~/.openmesh/default` — a text file containing the default profile name.
+    fn default_profile_path() -> Result<PathBuf, Error> {
+        let mut path = dirs_next::home_dir()
+            .ok_or_else(|| Error::OutputError("Could not find home directory".to_string()))?;
+        path.push(".openmesh");
+        path.push("default");
+        Ok(path)
+    }
+
+    /// Legacy single-session file path.
     pub fn get_session_path() -> Result<PathBuf, Error> {
-        let mut path = dirs_next::home_dir().ok_or_else(|| Error::OutputError("Could not find home directory".to_string()))?;
+        let mut path = dirs_next::home_dir()
+            .ok_or_else(|| Error::OutputError("Could not find home directory".to_string()))?;
         path.push(".openmesh_session.cookie");
         Ok(path)
     }
 
-    pub fn load() -> Result<Self, Error> {
-        let path = Self::get_session_path()?;
-        if !path.exists() {
-            return Err(Error::OutputError("No session found".to_string()));
+    // ─── Profile management ────────────────────────────────────────
+
+    /// List all profile names.
+    pub fn list_profiles() -> Result<Vec<String>, Error> {
+        let dir = Self::profiles_dir()?;
+        if !dir.exists() {
+            return Ok(vec![]);
         }
-        let content = fs::read_to_string(path).map_err(|e| Error::OutputError(e.to_string()))?;
-        let persisted: PersistedSession = serde_json::from_str(&content).map_err(Error::SerdeJsonError)?;
-        
-        let url_parsed = Url::parse(&persisted.url).map_err(|e| Error::OutputError(e.to_string()))?;
-        let domain = url_parsed.host_str().ok_or_else(|| Error::OutputError("Invalid URL in session".to_string()))?.to_string();
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(|e| Error::OutputError(e.to_string()))? {
+            let entry = entry.map_err(|e| Error::OutputError(e.to_string()))?;
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    names.push(stem.to_string());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// Get the default profile name, if set.
+    pub fn get_default_profile() -> Result<Option<String>, Error> {
+        let path = Self::default_profile_path()?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&path)
+            .map_err(|e| Error::OutputError(e.to_string()))?;
+        let name = content.trim().to_string();
+        if name.is_empty() { Ok(None) } else { Ok(Some(name)) }
+    }
+
+    /// Set the default profile name.
+    pub fn set_default_profile(name: &str) -> Result<(), Error> {
+        let path = Self::default_profile_path()?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| Error::OutputError(e.to_string()))?;
+        }
+        fs::write(&path, name).map_err(|e| Error::OutputError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete a named profile.
+    pub fn delete_profile(name: &str) -> Result<(), Error> {
+        let path = Self::profile_path(name)?;
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| Error::OutputError(e.to_string()))?;
+        }
+        // If this was the default, clear the default
+        if let Ok(Some(default)) = Self::get_default_profile() {
+            if default == name {
+                let _ = fs::remove_file(Self::default_profile_path()?);
+            }
+        }
+        Ok(())
+    }
+
+    // ─── Load / Save ───────────────────────────────────────────────
+
+    fn from_persisted(persisted: PersistedSession) -> Result<Self, Error> {
+        let url_parsed = Url::parse(&persisted.url)
+            .map_err(|e| Error::OutputError(e.to_string()))?;
+        let url_host = url_parsed.host_str()
+            .ok_or_else(|| Error::OutputError("Invalid URL in session".to_string()))?
+            .to_string();
+        // Use host_override if set (for IP-only xnodes needing manager.xnode.local)
+        let domain = persisted.host_override.unwrap_or(url_host);
         let origin = format!("{}://{}", url_parsed.scheme(), domain);
 
         let mut headers = reqwest::header::HeaderMap::new();
         if !persisted.cookies.is_empty() {
             let cookie_header = persisted.cookies.join("; ");
-            headers.insert(COOKIE, cookie_header.parse().map_err(|_| Error::OutputError("Invalid cookie header".to_string()))?);
+            headers.insert(COOKIE, cookie_header.parse()
+                .map_err(|_| Error::OutputError("Invalid cookie header".to_string()))?);
         }
-        
-        headers.insert("Host", domain.parse().map_err(|_| Error::OutputError("Invalid domain".to_string()))?);
-        headers.insert("Origin", origin.parse().map_err(|_| Error::OutputError("Invalid origin".to_string()))?);
+        headers.insert("Host", domain.parse()
+            .map_err(|_| Error::OutputError("Invalid domain".to_string()))?);
+        headers.insert("Origin", origin.parse()
+            .map_err(|_| Error::OutputError("Invalid origin".to_string()))?);
 
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
@@ -73,21 +169,86 @@ impl Session {
             .build()
             .map_err(Error::ReqwestError)?;
 
+        // Determine if host_override is in play
+        let url_host_check = url_parsed.host_str().unwrap_or("").to_string();
+        let host_override = if domain != url_host_check {
+            Some(domain.clone())
+        } else {
+            None
+        };
+
         Ok(Self {
             reqwest_client: client,
             base_url: persisted.url,
             domain,
             cookies: persisted.cookies,
+            host_override,
         })
     }
 
-    pub fn save(&self) -> Result<(), Error> {
+    /// Load a named profile.
+    pub fn load_profile(name: &str) -> Result<Self, Error> {
+        let path = Self::profile_path(name)?;
+        if !path.exists() {
+            return Err(Error::OutputError(format!(
+                "Profile '{}' not found. Run: om profile login {} -u <URL>",
+                name, name
+            )));
+        }
+        let content = fs::read_to_string(&path)
+            .map_err(|e| Error::OutputError(e.to_string()))?;
+        let persisted: PersistedSession = serde_json::from_str(&content)
+            .map_err(Error::SerdeJsonError)?;
+        Self::from_persisted(persisted)
+    }
+
+    /// Load the default session. Priority:
+    /// 1. Named profile (if --profile was passed or default is set)
+    /// 2. Legacy `~/.openmesh_session.cookie`
+    pub fn load() -> Result<Self, Error> {
+        // Try default profile first
+        if let Ok(Some(default)) = Self::get_default_profile() {
+            let path = Self::profile_path(&default)?;
+            if path.exists() {
+                return Self::load_profile(&default);
+            }
+        }
+
+        // Fall back to legacy session file
         let path = Self::get_session_path()?;
-        let persisted = PersistedSession {
+        if !path.exists() {
+            return Err(Error::OutputError("No session found. Run 'om login' or 'om profile login <name> -u <URL>'".to_string()));
+        }
+        let content = fs::read_to_string(path)
+            .map_err(|e| Error::OutputError(e.to_string()))?;
+        let persisted: PersistedSession = serde_json::from_str(&content)
+            .map_err(Error::SerdeJsonError)?;
+        Self::from_persisted(persisted)
+    }
+
+    fn to_persisted(&self) -> PersistedSession {
+        PersistedSession {
             url: self.base_url.clone(),
             cookies: self.cookies.clone(),
-        };
-        let content = serde_json::to_string(&persisted).map_err(Error::SerdeJsonError)?;
+            host_override: self.host_override.clone(),
+        }
+    }
+
+    /// Save to a named profile.
+    pub fn save_profile(&self, name: &str) -> Result<(), Error> {
+        let path = Self::profile_path(name)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| Error::OutputError(e.to_string()))?;
+        }
+        let content = serde_json::to_string(&self.to_persisted()).map_err(Error::SerdeJsonError)?;
+        fs::write(&path, content).map_err(|e| Error::OutputError(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Save to the legacy session file (backward compat).
+    pub fn save(&self) -> Result<(), Error> {
+        let path = Self::get_session_path()?;
+        let content = serde_json::to_string(&self.to_persisted()).map_err(Error::SerdeJsonError)?;
         fs::write(path, content).map_err(|e| Error::OutputError(e.to_string()))?;
         Ok(())
     }
@@ -261,21 +422,25 @@ pub async fn session_get<
         _ => {
             // FALLBACK TO CURL
             let mut curl = std::process::Command::new("curl");
-            curl.arg("-s").arg("-L");
+            curl.arg("-s").arg("-L").arg("-k");
             curl.arg("-H").arg(format!("Host: {}", session.domain));
             curl.arg("-H").arg("Origin: https://xnode.openmesh.network");
             curl.arg("-H").arg("Referer: https://xnode.openmesh.network/");
             curl.arg("-H").arg(format!("path: {}{}", scope, path_str));
             curl.arg("-A").arg("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36");
             
-            let mut cookie_jar_path = Session::get_session_path()?;
-            cookie_jar_path.set_extension("jar");
-            if cookie_jar_path.exists() {
-                curl.arg("-b").arg(&cookie_jar_path);
-            } else if !session.cookies.is_empty() {
+            // Always pass cookies inline from the session — this ensures
+            // profile-specific cookies are used, not the legacy jar file.
+            if !session.cookies.is_empty() {
                 curl.arg("-b").arg(session.cookies.join("; "));
+            } else {
+                let mut cookie_jar_path = Session::get_session_path()?;
+                cookie_jar_path.set_extension("jar");
+                if cookie_jar_path.exists() {
+                    curl.arg("-b").arg(&cookie_jar_path);
+                }
             }
-            
+
             let mut final_url = url.clone();
             if !query_params.is_empty() {
                 final_url.push('?');
@@ -357,7 +522,7 @@ pub async fn session_post<
             // with a browser User-Agent, so we shell out and pipe the JSON body via stdin
             // to avoid argv length limits and shell-escaping pitfalls.
             let mut curl = Command::new("curl");
-            curl.arg("-s").arg("-L").arg("-X").arg("POST");
+            curl.arg("-s").arg("-L").arg("-k").arg("-X").arg("POST");
             curl.arg("-H").arg(format!("Host: {}", session.domain));
             curl.arg("-H").arg("Origin: https://xnode.openmesh.network");
             curl.arg("-H").arg("Referer: https://xnode.openmesh.network/");
@@ -365,12 +530,8 @@ pub async fn session_post<
             curl.arg("-H").arg("Content-Type: application/json");
             curl.arg("-A").arg("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36");
 
-            // Reuse the persisted Netscape cookie jar written by `om login`.
-            let mut cookie_jar_path = Session::get_session_path()?;
-            cookie_jar_path.set_extension("jar");
-            if cookie_jar_path.exists() {
-                curl.arg("-b").arg(&cookie_jar_path);
-            } else if !session.cookies.is_empty() {
+            // Pass cookies inline from the session for profile support.
+            if !session.cookies.is_empty() {
                 curl.arg("-b").arg(session.cookies.join("; "));
             }
 

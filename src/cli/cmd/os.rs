@@ -56,6 +56,62 @@ pub enum OsAction {
     /// github repositories (subcommands: set / clear / status).
     #[command(subcommand)]
     GithubAuth(GithubAuthAction),
+
+    /// Set or view the xnode's public domain name.
+    #[command(subcommand)]
+    Domain(DomainAction),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DomainAction {
+    /// Claim a *.openmesh.cloud subdomain and configure the xnode.
+    ///
+    /// Reserves the DNS record via claim.dns.openmesh.network, then sets
+    /// the domain on the xnode and triggers an OS rebuild for ACME/TLS.
+    ///
+    /// Example:
+    ///   om os domain claim xnode
+    ///   om --profile v10 os domain claim xnode --email john@openxai.org
+    Claim {
+        /// Subdomain to claim (e.g., "xnode" → manager.xnode.openmesh.cloud).
+        subdomain: String,
+
+        /// ACME email for TLS certificates.
+        #[arg(long, default_value = "john@openxai.org")]
+        email: String,
+
+        /// Don't wait for the OS rebuild to finish.
+        #[arg(long)]
+        no_wait: bool,
+
+        /// Maximum seconds to wait for the rebuild.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+    /// Set the domain directly (skip DNS claim — use if DNS is already configured).
+    Set {
+        /// The fully qualified domain name.
+        domain: String,
+
+        /// ACME email for TLS certificates.
+        #[arg(long)]
+        email: Option<String>,
+
+        /// Don't wait for the OS rebuild to finish.
+        #[arg(long)]
+        no_wait: bool,
+
+        /// Maximum seconds to wait for the rebuild.
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
+    /// Check if a *.openmesh.cloud subdomain is available.
+    Check {
+        /// Subdomain to check (e.g., "xnode").
+        subdomain: String,
+    },
+    /// Show the xnode's current domain configuration.
+    Status,
 }
 
 #[derive(Subcommand, Debug)]
@@ -127,7 +183,212 @@ pub async fn run(action: OsAction, format: OutputFormat) -> CliResult<()> {
             }
             GithubAuthAction::Status => status_github_token(&session, format).await,
         },
+        OsAction::Domain(sub) => match sub {
+            DomainAction::Claim { subdomain, email, no_wait, timeout } => {
+                claim_domain(&session, &subdomain, &email, no_wait, timeout, format).await
+            }
+            DomainAction::Set { domain, email, no_wait, timeout } => {
+                set_domain(&session, &domain, email.as_deref(), no_wait, timeout, format).await
+            }
+            DomainAction::Check { subdomain } => check_domain(&subdomain, format).await,
+            DomainAction::Status => domain_status(&session, format).await,
+        },
     }
+}
+
+// ---------------------------------------------------------------------------
+// domain claim / check / set / status
+// ---------------------------------------------------------------------------
+
+const DNS_CLAIM_BASE: &str = "https://claim.dns.openmesh.network";
+
+async fn check_domain(subdomain: &str, _format: OutputFormat) -> CliResult<()> {
+    let url = format!("{}/{}/available", DNS_CLAIM_BASE, subdomain);
+    let output = std::process::Command::new("curl")
+        .arg("-s").arg("-k")
+        .arg(&url)
+        .output()
+        .map_err(|e| CliError::new(ErrorCode::Internal, format!("curl failed: {}", e)))?;
+    let body = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let domain = format!("manager.{}.openmesh.cloud", subdomain);
+    match body.as_str() {
+        "true" => println!("{} is available (→ {})", subdomain, domain),
+        "false" => println!("{} is taken (→ {})", subdomain, domain),
+        _ => println!("Unexpected response: {}", body),
+    }
+    Ok(())
+}
+
+async fn claim_domain(
+    session: &sdk::utils::Session,
+    subdomain: &str,
+    email: &str,
+    no_wait: bool,
+    timeout: u64,
+    format: OutputFormat,
+) -> CliResult<()> {
+    let domain = format!("manager.{}.openmesh.cloud", subdomain);
+
+    // Step 1: Check availability
+    println!("Checking availability of '{}'...", subdomain);
+    let check_url = format!("{}/{}/available", DNS_CLAIM_BASE, subdomain);
+    let output = std::process::Command::new("curl")
+        .arg("-s").arg("-k")
+        .arg(&check_url)
+        .output()
+        .map_err(|e| CliError::new(ErrorCode::Internal, format!("curl failed: {}", e)))?;
+    let available = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if available == "false" {
+        // Already claimed — check if it points to our IP
+        println!("  '{}' already claimed. Checking if it's ours...", subdomain);
+        let resolve = std::process::Command::new("dig")
+            .arg("+short").arg(&domain).arg("A")
+            .output()
+            .ok()
+            .and_then(|o| Some(String::from_utf8_lossy(&o.stdout).trim().to_string()));
+        if let Some(ip) = resolve {
+            if !ip.is_empty() {
+                println!("  {} → {} (already configured)", domain, ip);
+            }
+        }
+    } else {
+        // Step 2: Reserve the subdomain via DNS claim service
+        println!("Reserving DNS record for '{}'...", domain);
+
+        // Get the xnode's IP from the session URL
+        let url_parsed = url::Url::parse(&session.base_url)
+            .map_err(|e| CliError::new(ErrorCode::Internal, format!("Invalid session URL: {}", e)))?;
+        let ip = url_parsed.host_str()
+            .ok_or_else(|| CliError::new(ErrorCode::Internal, "No host in session URL".to_string()))?;
+
+        // The wallet address from the session cookies
+        let user = session.cookies.iter()
+            .find(|c| c.starts_with("xnode_auth_user="))
+            .map(|c| c.trim_start_matches("xnode_auth_user=").to_string())
+            .map(|u| u.replace("%3A", ":").replace("%2F", "/"))
+            .unwrap_or_default();
+
+        let reserve_url = format!("{}/{}/reserve", DNS_CLAIM_BASE, subdomain);
+        let payload = serde_json::json!({
+            "user": user,
+            "ipv4": ip
+        });
+
+        let reserve_output = std::process::Command::new("curl")
+            .arg("-s").arg("-k")
+            .arg("-X").arg("POST")
+            .arg("-H").arg("Content-Type: application/json")
+            .arg("-d").arg(serde_json::to_string(&payload).unwrap_or_default())
+            .arg(&reserve_url)
+            .output()
+            .map_err(|e| CliError::new(ErrorCode::Internal, format!("curl failed: {}", e)))?;
+
+        let reserve_body = String::from_utf8_lossy(&reserve_output.stdout);
+        if !reserve_output.status.success() {
+            return Err(CliError::new(ErrorCode::Internal,
+                format!("DNS claim failed: {}", reserve_body)));
+        }
+        println!("  DNS record created: {} → {}", domain, ip);
+    }
+
+    // Step 3: Re-login with the new domain so cookies are signed for it.
+    // xnode-auth validates the cookie signature against the Host header,
+    // so we need cookies signed for the target domain, not the IP.
+    println!("Re-authenticating with new domain '{}'...", domain);
+    let new_url = format!("https://{}", domain);
+
+    // Shell out to `om profile login` with the new URL
+    let login_output = std::process::Command::new("om")
+        .arg("profile").arg("login")
+        .arg(subdomain)  // temporary profile name
+        .arg("-u").arg(&new_url)
+        .output()
+        .map_err(|e| CliError::new(ErrorCode::Internal, format!("login failed: {}", e)))?;
+
+    if !login_output.status.success() {
+        let stderr = String::from_utf8_lossy(&login_output.stderr);
+        return Err(CliError::new(ErrorCode::Internal,
+            format!("Re-login with new domain failed: {}", stderr)));
+    }
+    println!("  Authenticated with {}", domain);
+
+    // Load the freshly created session for the new domain
+    let new_session = sdk::utils::Session::load_profile(subdomain)
+        .map_err(|e| CliError::new(ErrorCode::Internal, format!("Failed to load new session: {:?}", e)))?;
+
+    // Step 4: Set the domain on the xnode using the domain-signed session
+    println!("Configuring xnode with domain '{}'...", domain);
+    set_domain(&new_session, &domain, Some(email), no_wait, timeout, format).await
+}
+
+async fn set_domain(
+    session: &sdk::utils::Session,
+    domain: &str,
+    email: Option<&str>,
+    no_wait: bool,
+    timeout: u64,
+    _format: OutputFormat,
+) -> CliResult<()> {
+    println!("Setting domain to '{}' ...", domain);
+
+    let change = sdk::os::OSChange {
+        flake: None,
+        update_inputs: None,
+        xnode_owner: None,
+        domain: Some(domain.to_string()),
+        acme_email: email.map(|e| e.to_string()),
+        user_passwd: None,
+    };
+
+    let input = sdk::os::SetInput::new_with_data(session, change);
+    let resp = sdk::os::set(input).await?;
+
+    println!("submitted (request_id={})", resp.request_id);
+
+    if no_wait {
+        println!("Domain change submitted. Use `om req wait {}` to track.", resp.request_id);
+        return Ok(());
+    }
+
+    println!("waiting for OS rebuild...");
+    let info = wait_for_request(session, resp.request_id, timeout).await?;
+
+    match info.result {
+        Some(sdk::request::RequestIdResult::Success { .. }) => {
+            println!("Domain set to '{}'", domain);
+            if let Some(e) = email {
+                println!("  ACME email: {}", e);
+            }
+            println!("  The xnode will now serve TLS on this domain.");
+        }
+        Some(sdk::request::RequestIdResult::Error { error }) => {
+            return Err(CliError::new(ErrorCode::Internal, format!("Domain set failed: {}", error)));
+        }
+        None => {
+            return Err(CliError::new(ErrorCode::Internal, "Domain set timed out".to_string()));
+        }
+    }
+
+    Ok(())
+}
+
+async fn domain_status(
+    session: &sdk::utils::Session,
+    _format: OutputFormat,
+) -> CliResult<()> {
+    let input = sdk::os::GetInput::new(session);
+    let config = sdk::os::get(input).await?;
+
+    println!("Domain: {}", config.domain.unwrap_or_else(|| "(not set)".to_string()));
+    if let Some(email) = config.acme_email {
+        println!("  ACME email: {}", email);
+    }
+    if let Some(owner) = config.xnode_owner {
+        println!("  Owner: {}", owner);
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
