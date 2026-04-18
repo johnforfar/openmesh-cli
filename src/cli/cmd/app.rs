@@ -142,6 +142,22 @@ pub enum AppAction {
         level: Option<String>,
     },
 
+    /// Manage environment variables (secrets) for a container.
+    ///
+    /// Secrets are stored in the container's /xnode-config/env file and
+    /// loaded by systemd at service start via EnvironmentFile. They never
+    /// enter git or the nix store.
+    ///
+    /// Examples:
+    ///   om app env list my-app
+    ///   om app env set my-app DISCORD_TOKEN=abc123 SMTP_PASS=secret
+    ///   om app env remove my-app DISCORD_TOKEN
+    Env {
+        /// The env subcommand to run.
+        #[command(subcommand)]
+        action: EnvAction,
+    },
+
     /// Remove a reverse-proxy rule for a subdomain.
     Unexpose {
         /// FQDN to remove, e.g. `demo.build.openmesh.cloud`.
@@ -159,6 +175,42 @@ pub enum AppAction {
         /// Show the flake diff without applying.
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EnvAction {
+    /// List all environment variables for a container (values masked).
+    List {
+        /// The container name.
+        name: String,
+
+        /// Show full values (DANGER: prints secrets to terminal).
+        #[arg(long)]
+        show_values: bool,
+    },
+
+    /// Set one or more environment variables for a container.
+    ///
+    /// Format: KEY=VALUE (multiple pairs allowed).
+    /// Existing variables are preserved; matching keys are overwritten.
+    Set {
+        /// The container name.
+        name: String,
+
+        /// KEY=VALUE pairs to set.
+        #[arg(required = true)]
+        pairs: Vec<String>,
+    },
+
+    /// Remove one or more environment variables from a container.
+    Remove {
+        /// The container name.
+        name: String,
+
+        /// Variable names to remove.
+        #[arg(required = true)]
+        keys: Vec<String>,
     },
 }
 
@@ -222,6 +274,9 @@ pub async fn run(action: AppAction, format: OutputFormat) -> CliResult<()> {
         } => unexpose(&session, domain, wait, timeout, dry_run, format).await,
         AppAction::Logs { name, max, level } => {
             app_logs(&session, name, max, level, format).await
+        }
+        AppAction::Env { action: env_action } => {
+            app_env(&session, env_action, format).await
         }
     }
 }
@@ -895,6 +950,271 @@ async fn app_logs(
     }
 
     Ok(())
+}
+
+// =============================================================================
+// env — secure environment variable management
+// =============================================================================
+
+const ENV_FILE_PATH: &str = "/xnode-config/env";
+
+async fn app_env(
+    session: &sdk::utils::Session,
+    action: EnvAction,
+    format: OutputFormat,
+) -> CliResult<()> {
+    match action {
+        EnvAction::List { name, show_values } => env_list(session, name, show_values, format).await,
+        EnvAction::Set { name, pairs } => env_set(session, name, pairs, format).await,
+        EnvAction::Remove { name, keys } => env_remove(session, name, keys, format).await,
+    }
+}
+
+/// Read the current env file from the container. Returns a Vec of (key, value) pairs.
+async fn env_read(session: &sdk::utils::Session, name: &str) -> CliResult<Vec<(String, String)>> {
+    let scope = format!("container:{}", name);
+    let input = sdk::file::ReadFileInput {
+        session,
+        path: sdk::file::ReadFilePath { scope },
+        query: sdk::file::ReadFile { path: ENV_FILE_PATH.to_string() },
+    };
+
+    match sdk::file::read_file(input).await {
+        Ok(file) => {
+            let content = match &file.content {
+                sdk::utils::Output::UTF8 { output } => output.clone(),
+                sdk::utils::Output::Bytes { output } => {
+                    String::from_utf8_lossy(output).to_string()
+                }
+            };
+            Ok(parse_env(&content))
+        }
+        Err(_) => Ok(Vec::new()), // File doesn't exist yet — empty env
+    }
+}
+
+/// Write env pairs to the container's env file.
+async fn env_write(
+    session: &sdk::utils::Session,
+    name: &str,
+    pairs: &[(String, String)],
+) -> CliResult<()> {
+    let scope = format!("container:{}", name);
+
+    // Build env file content: KEY=VALUE per line, no quoting (systemd EnvironmentFile format)
+    let content: String = pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let input = sdk::file::WriteFileInput {
+        session,
+        path: sdk::file::WriteFilePath { scope },
+        data: sdk::file::WriteFile {
+            path: ENV_FILE_PATH.to_string(),
+            content: content.into_bytes(),
+        },
+    };
+
+    sdk::file::write_file(input).await.map_err(|e| {
+        CliError::new(crate::cli::error::ErrorCode::ManagerUnreachable, format!("failed to write env file: {}", e))
+    })?;
+
+    Ok(())
+}
+
+fn parse_env(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut parts = l.splitn(2, '=');
+            let key = parts.next()?.trim().to_string();
+            let value = parts.next().unwrap_or("").to_string();
+            if key.is_empty() { None } else { Some((key, value)) }
+        })
+        .collect()
+}
+
+fn mask_value(value: &str) -> String {
+    if value.len() <= 4 {
+        "****".to_string()
+    } else {
+        format!("{}****", &value[..4])
+    }
+}
+
+/// Validate an env key: must be ASCII, alphanumeric + underscore, start with letter.
+fn validate_env_key(key: &str) -> CliResult<()> {
+    if key.is_empty() {
+        return Err(CliError::invalid_input("env key must not be empty"));
+    }
+    if !key.chars().next().unwrap().is_ascii_alphabetic() && key.chars().next().unwrap() != '_' {
+        return Err(CliError::invalid_input(format!(
+            "env key `{}` must start with a letter or underscore", key
+        )));
+    }
+    for c in key.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            return Err(CliError::invalid_input(format!(
+                "env key `{}` contains invalid character `{}`; allowed: A-Z a-z 0-9 _", key, c
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn env_list(
+    session: &sdk::utils::Session,
+    name: String,
+    show_values: bool,
+    format: OutputFormat,
+) -> CliResult<()> {
+    validate_container_name(&name)?;
+    let pairs = env_read(session, &name).await?;
+    let view = EnvListView { name, pairs, show_values };
+    render(&view, format)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct EnvListView {
+    name: String,
+    pairs: Vec<(String, String)>,
+    show_values: bool,
+}
+
+impl Renderable for EnvListView {
+    fn render_plain(&self, w: &mut dyn Write) -> std::io::Result<()> {
+        if self.pairs.is_empty() {
+            writeln!(w, "No env vars set for `{}`.", self.name)?;
+            writeln!(w, "Use `om app env set {} KEY=VALUE` to add secrets.", self.name)?;
+        } else {
+            writeln!(w, "Env vars for `{}` ({} total):", self.name, self.pairs.len())?;
+            for (key, value) in &self.pairs {
+                if self.show_values {
+                    writeln!(w, "  {}={}", key, value)?;
+                } else {
+                    writeln!(w, "  {}={}", key, mask_value(value))?;
+                }
+            }
+            if !self.show_values {
+                writeln!(w)?;
+                writeln!(w, "Use --show-values to reveal full values (prints secrets to terminal).")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn env_set(
+    session: &sdk::utils::Session,
+    name: String,
+    pairs: Vec<String>,
+    format: OutputFormat,
+) -> CliResult<()> {
+    validate_container_name(&name)?;
+
+    // Parse and validate KEY=VALUE pairs
+    let mut new_pairs: Vec<(String, String)> = Vec::new();
+    for pair in &pairs {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next().unwrap_or("").to_string();
+        let value = parts.next().ok_or_else(|| {
+            CliError::invalid_input(format!(
+                "invalid format `{}`; expected KEY=VALUE", pair
+            ))
+        })?.to_string();
+        validate_env_key(&key)?;
+        new_pairs.push((key, value));
+    }
+
+    // Read existing, merge, write
+    let mut existing = env_read(session, &name).await?;
+    for (key, value) in &new_pairs {
+        if let Some(pos) = existing.iter().position(|(k, _)| k == key) {
+            existing[pos].1 = value.clone();
+        } else {
+            existing.push((key.clone(), value.clone()));
+        }
+    }
+
+    env_write(session, &name, &existing).await?;
+
+    let keys_set: Vec<String> = new_pairs.iter().map(|(k, _)| k.clone()).collect();
+    let view = EnvSetView {
+        name,
+        keys_set,
+        total: existing.len(),
+    };
+    render(&view, format)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct EnvSetView {
+    name: String,
+    keys_set: Vec<String>,
+    total: usize,
+}
+
+impl Renderable for EnvSetView {
+    fn render_plain(&self, w: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(w, "Set {} var(s) for `{}`:", self.keys_set.len(), self.name)?;
+        for key in &self.keys_set {
+            writeln!(w, "  {} ✓", key)?;
+        }
+        writeln!(w, "Total env vars: {}", self.total)?;
+        writeln!(w)?;
+        writeln!(w, "Restart the app to pick up changes:")?;
+        writeln!(w, "  om app deploy --flake <URI> {}", self.name)?;
+        Ok(())
+    }
+}
+
+async fn env_remove(
+    session: &sdk::utils::Session,
+    name: String,
+    keys: Vec<String>,
+    format: OutputFormat,
+) -> CliResult<()> {
+    validate_container_name(&name)?;
+
+    let mut existing = env_read(session, &name).await?;
+    let before = existing.len();
+    existing.retain(|(k, _)| !keys.contains(k));
+    let removed = before - existing.len();
+
+    env_write(session, &name, &existing).await?;
+
+    let view = EnvRemoveView {
+        name,
+        keys_removed: keys,
+        actually_removed: removed,
+        total: existing.len(),
+    };
+    render(&view, format)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct EnvRemoveView {
+    name: String,
+    keys_removed: Vec<String>,
+    actually_removed: usize,
+    total: usize,
+}
+
+impl Renderable for EnvRemoveView {
+    fn render_plain(&self, w: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(w, "Removed {} var(s) from `{}`.", self.actually_removed, self.name)?;
+        for key in &self.keys_removed {
+            writeln!(w, "  {} ✗", key)?;
+        }
+        writeln!(w, "Remaining env vars: {}", self.total)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
