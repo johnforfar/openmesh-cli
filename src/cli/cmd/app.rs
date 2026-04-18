@@ -142,6 +142,24 @@ pub enum AppAction {
         level: Option<String>,
     },
 
+    /// Set the xnode role (primary or replica) for a container.
+    ///
+    /// Writes /xnode-config/role. The wrapper flake reads this at build time
+    /// and passes xnodeRole as a specialArg. Used by apps to enable
+    /// role-specific behavior: backup services on primary, backup-pull and
+    /// read-only replica on secondary.
+    ///
+    /// Example:
+    ///   om --profile xnode-2 app set-role xnode-v10-app primary
+    ///   om --profile hermes  app set-role xnode-v10-app replica
+    SetRole {
+        /// The container name.
+        name: String,
+
+        /// Role: "primary" or "replica".
+        role: String,
+    },
+
     /// Set the public domain for a container (writes /xnode-config/domain).
     ///
     /// This value is available to the container's nix module at build time
@@ -297,6 +315,9 @@ pub async fn run(action: AppAction, format: OutputFormat) -> CliResult<()> {
         AppAction::SetDomain { name, domain } => {
             app_set_domain(&session, name, domain, format).await
         }
+        AppAction::SetRole { name, role } => {
+            app_set_role(&session, name, role, format).await
+        }
     }
 }
 
@@ -450,9 +471,15 @@ fn wrap_uri_into_flake_expr(uri: &str) -> String {
       if builtins.pathExists xnodeDomainFile
       then inputs.nixpkgs.lib.strings.removeSuffix "\n" (builtins.readFile xnodeDomainFile)
       else inputs.nixpkgs.lib.strings.removeSuffix "\n" (builtins.readFile ./xnode-config/hostname);
+    # Read xnode-config/role for primary/replica role (defaults to "primary").
+    xnodeRoleFile = ./xnode-config/role;
+    xnodeRole =
+      if builtins.pathExists xnodeRoleFile
+      then inputs.nixpkgs.lib.strings.removeSuffix "\n" (builtins.readFile xnodeRoleFile)
+      else "primary";
   in {{
     nixosConfigurations.container = inputs.nixpkgs.lib.nixosSystem {{
-      specialArgs = {{ inherit inputs xnodeDomain; }};
+      specialArgs = {{ inherit inputs xnodeDomain xnodeRole; }};
       modules = [
         inputs.xnode-manager.nixosModules.container
         {{
@@ -1041,6 +1068,62 @@ impl Renderable for SetDomainView {
     fn render_plain(&self, w: &mut dyn Write) -> std::io::Result<()> {
         writeln!(w, "Domain set for `{}`:", self.name)?;
         writeln!(w, "  → {}", self.domain)?;
+        writeln!(w)?;
+        writeln!(w, "Next: redeploy so the nix build picks it up:")?;
+        writeln!(w, "  om app deploy --flake <URI> {}", self.name)?;
+        Ok(())
+    }
+}
+
+// =============================================================================
+// set-role — write /xnode-config/role for role-aware deploys
+// =============================================================================
+
+async fn app_set_role(
+    session: &sdk::utils::Session,
+    name: String,
+    role: String,
+    format: OutputFormat,
+) -> CliResult<()> {
+    validate_container_name(&name)?;
+    if role != "primary" && role != "replica" {
+        return Err(CliError::invalid_input(
+            "role must be 'primary' or 'replica'",
+        ));
+    }
+
+    let scope = format!("container:{}", name);
+    let input = sdk::file::WriteFileInput {
+        session,
+        path: sdk::file::WriteFilePath { scope },
+        data: sdk::file::WriteFile {
+            path: "/xnode-config/role".to_string(),
+            content: role.clone().into_bytes(),
+        },
+    };
+
+    sdk::file::write_file(input).await.map_err(|e| {
+        CliError::new(
+            crate::cli::error::ErrorCode::ManagerUnreachable,
+            format!("failed to write role: {}", e),
+        )
+    })?;
+
+    let view = SetRoleView { name, role };
+    render(&view, format)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct SetRoleView {
+    name: String,
+    role: String,
+}
+
+impl Renderable for SetRoleView {
+    fn render_plain(&self, w: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(w, "Role set for `{}`:", self.name)?;
+        writeln!(w, "  → {}", self.role)?;
         writeln!(w)?;
         writeln!(w, "Next: redeploy so the nix build picks it up:")?;
         writeln!(w, "  om app deploy --flake <URI> {}", self.name)?;
