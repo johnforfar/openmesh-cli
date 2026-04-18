@@ -267,18 +267,27 @@ async fn main() -> Result<()> {
                 let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs().to_string();
                 let url_parsed = url::Url::parse(url)
                     .map_err(|e| anyhow!("Invalid URL: {}", e))?;
-                // Use host override for domain signing if provided (for IP-only xnodes)
                 let actual_host = url_parsed.host_str()
                     .ok_or_else(|| anyhow!("No host in URL"))?;
+                // For IP-only xnodes (--host override), sign for "manager.xnode.local"
+                // which is the default nginx server_name that xnode-auth validates against.
+                // Without this, the signature domain mismatches and validate returns 401.
+                let is_ip = actual_host.parse::<std::net::IpAddr>().is_ok()
+                    || host.as_ref().map_or(false, |h| h.parse::<std::net::IpAddr>().is_ok());
+                let sign_domain = if is_ip { "manager.xnode.local" } else { host.as_deref().unwrap_or(actual_host) };
                 let domain = host.as_deref().unwrap_or(actual_host);
                 let origin = format!("https://{}", domain);
                 if host.is_some() {
                     println!("  Host override: {}", domain);
                 }
+                if is_ip {
+                    println!("  Signing domain: {} (IP-only xnode bootstrap)", sign_domain);
+                }
 
                 let user_addr_plain = address.trim_start_matches("0x").to_lowercase();
                 let user_addr_prefixed = format!("eth:{}", user_addr_plain);
-                let message = format!("Xnode Auth authenticate {} at {}", domain, timestamp);
+                // Sign for sign_domain (manager.xnode.local for IP xnodes, actual domain otherwise)
+                let message = format!("Xnode Auth authenticate {} at {}", sign_domain, timestamp);
 
                 let eth_prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
                 let mut eth_message = eth_prefix.into_bytes();
@@ -302,7 +311,10 @@ async fn main() -> Result<()> {
                     "timestamp": timestamp
                 });
 
-                // Use curl fallback directly (most reliable)
+                // Use curl fallback directly (most reliable).
+                // Send Host: manager.xnode.local for IP-only xnodes so the login
+                // and validate endpoints see the same domain for signature verification.
+                let curl_host = if is_ip { "manager.xnode.local" } else { domain };
                 let cookie_file = format!("/tmp/om_profile_{}.txt", name);
                 let _ = fs::remove_file(&cookie_file);
                 let _ = std::process::Command::new("curl")
@@ -312,7 +324,7 @@ async fn main() -> Result<()> {
                     .arg(&login_url)
                     .arg("-H").arg("Content-Type: application/json")
                     .arg("-H").arg(format!("Origin: {}", origin))
-                    .arg("-H").arg(format!("Host: {}", domain))
+                    .arg("-H").arg(format!("Host: {}", curl_host))
                     .arg("-H").arg(format!("Referer: {}/xnode-auth", origin))
                     .arg("-A").arg("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
                     .arg("-d").arg(serde_json::to_string(&login_payload)?)
@@ -335,10 +347,14 @@ async fn main() -> Result<()> {
                     let client = reqwest::Client::builder()
                         .danger_accept_invalid_certs(true)
                         .build()?;
+                    // For IP-only xnodes, use manager.xnode.local as the domain
+                    // so all subsequent API calls send the correct Host header
+                    // that matches the nginx server_name for xnode-auth validation.
+                    let session_domain = if is_ip { "manager.xnode.local".to_string() } else { domain.to_string() };
                     let session = Session {
                         reqwest_client: client,
                         base_url: url.clone(),
-                        domain: domain.to_string(),
+                        domain: session_domain,
                         cookies: session_cookies,
                         host_override: host.clone(),
                     };
