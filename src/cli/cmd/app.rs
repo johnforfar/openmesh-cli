@@ -142,6 +142,22 @@ pub enum AppAction {
         level: Option<String>,
     },
 
+    /// Set the public domain for a container (writes /xnode-config/domain).
+    ///
+    /// This value is available to the container's nix module at build time
+    /// via the `xnodeDomain` specialArg. Used for nginx serverName matching
+    /// so the SAME commit can deploy to multiple xnodes with different domains.
+    ///
+    /// Example:
+    ///   om --profile xnode-2 app domain set xnode-v10-app v10.own.openmesh.cloud
+    SetDomain {
+        /// The container name.
+        name: String,
+
+        /// The public domain (must match the expose rule + DNS A record).
+        domain: String,
+    },
+
     /// Manage environment variables (secrets) for a container.
     ///
     /// Secrets are stored in the container's /xnode-config/env file and
@@ -277,6 +293,9 @@ pub async fn run(action: AppAction, format: OutputFormat) -> CliResult<()> {
         }
         AppAction::Env { action: env_action } => {
             app_env(&session, env_action, format).await
+        }
+        AppAction::SetDomain { name, domain } => {
+            app_set_domain(&session, name, domain, format).await
         }
     }
 }
@@ -422,9 +441,18 @@ fn wrap_uri_into_flake_expr(uri: &str) -> String {
     nixpkgs.follows = "openclaw/nixpkgs";
   }};
 
-  outputs = inputs: {{
+  outputs = inputs: let
+    # Read xnode-config/domain at build time so per-xnode domain is injected
+    # into app modules via specialArgs. Falls back to container hostname if
+    # the file doesn't exist (first-deploy bootstrap).
+    xnodeDomainFile = ./xnode-config/domain;
+    xnodeDomain =
+      if builtins.pathExists xnodeDomainFile
+      then inputs.nixpkgs.lib.strings.removeSuffix "\n" (builtins.readFile xnodeDomainFile)
+      else inputs.nixpkgs.lib.strings.removeSuffix "\n" (builtins.readFile ./xnode-config/hostname);
+  in {{
     nixosConfigurations.container = inputs.nixpkgs.lib.nixosSystem {{
-      specialArgs = {{ inherit inputs; }};
+      specialArgs = {{ inherit inputs xnodeDomain; }};
       modules = [
         inputs.xnode-manager.nixosModules.container
         {{
@@ -950,6 +978,74 @@ async fn app_logs(
     }
 
     Ok(())
+}
+
+// =============================================================================
+// set-domain — write /xnode-config/domain for per-xnode domain override
+// =============================================================================
+
+async fn app_set_domain(
+    session: &sdk::utils::Session,
+    name: String,
+    domain: String,
+    format: OutputFormat,
+) -> CliResult<()> {
+    validate_container_name(&name)?;
+    if domain.is_empty() || !domain.contains('.') {
+        return Err(CliError::invalid_input(
+            "domain must be a valid FQDN (e.g. app.example.com)",
+        ));
+    }
+    for c in domain.chars() {
+        if !(c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+            return Err(CliError::invalid_input(format!(
+                "domain `{}` contains invalid character `{}`", domain, c
+            )));
+        }
+    }
+
+    // The xnode-config/domain file is read by the wrapper flake at build time
+    // and passed to modules as the `xnodeDomain` specialArg. Writing to the
+    // container settings dir (scope = container:<name>) means it lives at
+    // /var/lib/xnode-manager/containers/<name>/xnode-config/domain, which is
+    // exactly where the wrapper flake looks for it.
+    let scope = format!("container:{}", name);
+    let input = sdk::file::WriteFileInput {
+        session,
+        path: sdk::file::WriteFilePath { scope },
+        data: sdk::file::WriteFile {
+            path: "/xnode-config/domain".to_string(),
+            content: domain.clone().into_bytes(),
+        },
+    };
+
+    sdk::file::write_file(input).await.map_err(|e| {
+        CliError::new(
+            crate::cli::error::ErrorCode::ManagerUnreachable,
+            format!("failed to write domain: {}", e),
+        )
+    })?;
+
+    let view = SetDomainView { name, domain };
+    render(&view, format)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct SetDomainView {
+    name: String,
+    domain: String,
+}
+
+impl Renderable for SetDomainView {
+    fn render_plain(&self, w: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(w, "Domain set for `{}`:", self.name)?;
+        writeln!(w, "  → {}", self.domain)?;
+        writeln!(w)?;
+        writeln!(w, "Next: redeploy so the nix build picks it up:")?;
+        writeln!(w, "  om app deploy --flake <URI> {}", self.name)?;
+        Ok(())
+    }
 }
 
 // =============================================================================

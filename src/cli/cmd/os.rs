@@ -700,7 +700,7 @@ fn is_plausible_github_pat(token: &str) -> bool {
     if t.is_empty() {
         return false;
     }
-    (t.starts_with("ghp_") || t.starts_with("github_pat_")) && t.len() >= 20
+    (t.starts_with("ghp_") || t.starts_with("github_pat_") || t.starts_with("gho_")) && t.len() >= 20
 }
 
 // ---------------------------------------------------------------------------
