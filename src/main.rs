@@ -351,12 +351,17 @@ async fn main() -> Result<()> {
                     // so all subsequent API calls send the correct Host header
                     // that matches the nginx server_name for xnode-auth validation.
                     let session_domain = if is_ip { "manager.xnode.local".to_string() } else { domain.to_string() };
+                    // Persist the signing/Host domain as host_override so subsequent
+                    // calls (after session reload) keep sending Host: manager.xnode.local
+                    // for IP-only xnodes. Without this, from_persisted() falls back to
+                    // the URL host (the raw IP), nginx can't match server_name, → 401.
+                    let persisted_override = if is_ip { Some(session_domain.clone()) } else { host.clone() };
                     let session = Session {
                         reqwest_client: client,
                         base_url: url.clone(),
                         domain: session_domain,
                         cookies: session_cookies,
-                        host_override: host.clone(),
+                        host_override: persisted_override,
                     };
                     // Save to named profile
                     session.save_profile(name)
@@ -464,14 +469,21 @@ async fn main() -> Result<()> {
             
             // Extract domain from URL dynamically
             let url_parsed = url::Url::parse(&target_url).map_err(|e| anyhow!("Invalid URL: {}", e))?;
-            let domain = url_parsed.host_str().ok_or_else(|| anyhow!("No host in URL"))?;
-            let origin = format!("{}://{}", url_parsed.scheme(), domain);
+            let actual_host = url_parsed.host_str().ok_or_else(|| anyhow!("No host in URL"))?;
+            // For IP-only xnodes (e.g. --url https://74.50.126.86), sign for
+            // "manager.xnode.local" — the default nginx server_name that
+            // xnode-auth validates against. Without this, signature/Host
+            // mismatches and validate returns 401. Same pattern as
+            // ProfileAction::Login.
+            let is_ip = actual_host.parse::<std::net::IpAddr>().is_ok();
+            let domain = if is_ip { "manager.xnode.local" } else { actual_host };
+            let origin = format!("https://{}", domain);
 
             // The backend identity in the cookie MUST match the format expected by the manager proxy.
             // Reference code in xnode-address.ts uses .toLowerCase() for the identity string.
             let user_addr_plain = address.trim_start_matches("0x").to_lowercase();
             let user_addr_prefixed = format!("eth:{}", user_addr_plain);
-            
+
             let message = format!("Xnode Auth authenticate {} at {}", domain, timestamp);
             
             let eth_prefix = format!("\x19Ethereum Signed Message:\n{}", message.len());
@@ -532,6 +544,7 @@ async fn main() -> Result<()> {
                     let _ = std::process::Command::new("curl")
                         .arg("-s")
                         .arg("-L")
+                        .arg("-k")  // accept self-signed / SNI-mismatched certs (IP-only xnodes)
                         .arg("-c").arg(cookie_file)
                         .arg("-X").arg("POST")
                         .arg(&login_url)
