@@ -162,20 +162,24 @@ impl Session {
         headers.insert("Origin", origin.parse()
             .map_err(|_| Error::OutputError("Invalid origin".to_string()))?);
 
-        let client = Client::builder()
-            .danger_accept_invalid_certs(true)
-            .default_headers(headers)
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .map_err(Error::ReqwestError)?;
-
-        // Determine if host_override is in play
+        // Determine if host_override is in play (IP-only xnode bootstrap).
+        // Only bypass TLS cert verification for IP-only sessions — domain-based
+        // sessions must validate the cert to prevent MITM of session cookies.
         let url_host_check = url_parsed.host_str().unwrap_or("").to_string();
         let host_override = if domain != url_host_check {
             Some(domain.clone())
         } else {
             None
         };
+        let is_ip_only = host_override.is_some();
+
+        let mut client_builder = Client::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::limited(10));
+        if is_ip_only {
+            client_builder = client_builder.danger_accept_invalid_certs(true);
+        }
+        let client = client_builder.build().map_err(Error::ReqwestError)?;
 
         Ok(Self {
             reqwest_client: client,
@@ -422,7 +426,13 @@ pub async fn session_get<
         _ => {
             // FALLBACK TO CURL
             let mut curl = std::process::Command::new("curl");
-            curl.arg("-s").arg("-L").arg("-k");
+            curl.arg("-s").arg("-L");
+            // Only bypass TLS for IP-only xnode bootstrap sessions. Domain-
+            // verified sessions (community.openxai.org etc.) must validate
+            // the cert — otherwise an on-path attacker could MITM the API.
+            if session.host_override.is_some() {
+                curl.arg("-k");
+            }
             curl.arg("-H").arg(format!("Host: {}", session.domain));
             curl.arg("-H").arg("Origin: https://xnode.openmesh.network");
             curl.arg("-H").arg("Referer: https://xnode.openmesh.network/");
@@ -522,7 +532,12 @@ pub async fn session_post<
             // with a browser User-Agent, so we shell out and pipe the JSON body via stdin
             // to avoid argv length limits and shell-escaping pitfalls.
             let mut curl = Command::new("curl");
-            curl.arg("-s").arg("-L").arg("-k").arg("-X").arg("POST");
+            curl.arg("-s").arg("-L");
+            // See note in session_get: -k is IP-only bootstrap only.
+            if session.host_override.is_some() {
+                curl.arg("-k");
+            }
+            curl.arg("-X").arg("POST");
             curl.arg("-H").arg(format!("Host: {}", session.domain));
             curl.arg("-H").arg("Origin: https://xnode.openmesh.network");
             curl.arg("-H").arg("Referer: https://xnode.openmesh.network/");

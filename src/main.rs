@@ -317,8 +317,14 @@ async fn main() -> Result<()> {
                 let curl_host = if is_ip { "manager.xnode.local" } else { domain };
                 let cookie_file = format!("/tmp/om_profile_{}.txt", name);
                 let _ = fs::remove_file(&cookie_file);
-                let _ = std::process::Command::new("curl")
-                    .arg("-s").arg("-L").arg("-k")
+                // Only bypass cert verification for IP-only xnode bootstrap.
+                // Domain-based logins must validate the TLS cert.
+                let mut login_curl = std::process::Command::new("curl");
+                login_curl.arg("-s").arg("-L");
+                if is_ip {
+                    login_curl.arg("-k");
+                }
+                let _ = login_curl
                     .arg("-c").arg(&cookie_file)
                     .arg("-X").arg("POST")
                     .arg(&login_url)
@@ -344,9 +350,13 @@ async fn main() -> Result<()> {
 
                 let success = session_cookies.iter().any(|c| c.contains("xnode_auth_signature"));
                 if success && !session_cookies.is_empty() {
-                    let client = reqwest::Client::builder()
-                        .danger_accept_invalid_certs(true)
-                        .build()?;
+                    // Only accept invalid certs for IP-only bootstrap; domain
+                    // sessions validate the cert to protect session cookies.
+                    let mut builder = reqwest::Client::builder();
+                    if is_ip {
+                        builder = builder.danger_accept_invalid_certs(true);
+                    }
+                    let client = builder.build()?;
                     // For IP-only xnodes, use manager.xnode.local as the domain
                     // so all subsequent API calls send the correct Host header
                     // that matches the nginx server_name for xnode-auth validation.
@@ -511,9 +521,14 @@ async fn main() -> Result<()> {
                 "timestamp": timestamp 
             });
 
-            let client = reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()?;
+            // Only bypass cert verification for IP-only xnode bootstrap.
+            // Domain-based logins must validate the TLS cert to prevent MITM
+            // of the session cookie.
+            let mut builder = reqwest::Client::builder();
+            if is_ip {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
+            let client = builder.build()?;
 
             let resp = client.post(&login_url)
                 .header("Content-Type", "application/json")
@@ -541,10 +556,13 @@ async fn main() -> Result<()> {
                     println!("⚠️ Rust client failed or returned 400. Attempting fallback via system curl...");
                     let cookie_file = "/tmp/om_cookies.txt";
                     let _ = fs::remove_file(cookie_file); // Ensure fresh cookies
-                    let _ = std::process::Command::new("curl")
-                        .arg("-s")
-                        .arg("-L")
-                        .arg("-k")  // accept self-signed / SNI-mismatched certs (IP-only xnodes)
+                    let mut fallback = std::process::Command::new("curl");
+                    fallback.arg("-s").arg("-L");
+                    if is_ip {
+                        // accept self-signed / SNI-mismatched certs (IP-only xnodes)
+                        fallback.arg("-k");
+                    }
+                    let _ = fallback
                         .arg("-c").arg(cookie_file)
                         .arg("-X").arg("POST")
                         .arg(&login_url)

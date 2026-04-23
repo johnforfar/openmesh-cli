@@ -77,7 +77,7 @@ pub enum DomainAction {
         subdomain: String,
 
         /// ACME email for TLS certificates.
-        #[arg(long, default_value = "john@openxai.org")]
+        #[arg(long)]
         email: String,
 
         /// Don't wait for the OS rebuild to finish.
@@ -205,7 +205,7 @@ const DNS_CLAIM_BASE: &str = "https://claim.dns.openmesh.network";
 async fn check_domain(subdomain: &str, _format: OutputFormat) -> CliResult<()> {
     let url = format!("{}/{}/available", DNS_CLAIM_BASE, subdomain);
     let output = std::process::Command::new("curl")
-        .arg("-s").arg("-k")
+        .arg("-s")
         .arg(&url)
         .output()
         .map_err(|e| CliError::new(ErrorCode::Internal, format!("curl failed: {}", e)))?;
@@ -233,7 +233,7 @@ async fn claim_domain(
     println!("Checking availability of '{}'...", subdomain);
     let check_url = format!("{}/{}/available", DNS_CLAIM_BASE, subdomain);
     let output = std::process::Command::new("curl")
-        .arg("-s").arg("-k")
+        .arg("-s")
         .arg(&check_url)
         .output()
         .map_err(|e| CliError::new(ErrorCode::Internal, format!("curl failed: {}", e)))?;
@@ -276,7 +276,7 @@ async fn claim_domain(
         });
 
         let reserve_output = std::process::Command::new("curl")
-            .arg("-s").arg("-k")
+            .arg("-s")
             .arg("-X").arg("POST")
             .arg("-H").arg("Content-Type: application/json")
             .arg("-d").arg(serde_json::to_string(&payload).unwrap_or_default())
