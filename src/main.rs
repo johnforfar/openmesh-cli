@@ -315,7 +315,13 @@ async fn main() -> Result<()> {
                 // Send Host: manager.xnode.local for IP-only xnodes so the login
                 // and validate endpoints see the same domain for signature verification.
                 let curl_host = if is_ip { "manager.xnode.local" } else { domain };
-                let cookie_file = format!("/tmp/om_profile_{}.txt", name);
+                // Cross-platform temp path: /tmp on Linux, /var/folders/... on
+                // macOS, %LOCALAPPDATA%\Temp on Windows. The previous hardcoded
+                // "/tmp/..." silently failed on Windows because C:\tmp does not
+                // exist — curl wrote nothing, no cookies parsed, login appeared
+                // to fail even when the server accepted the POST.
+                let cookie_file_path = std::env::temp_dir().join(format!("om_profile_{}.txt", name));
+                let cookie_file = cookie_file_path.to_string_lossy().to_string();
                 let _ = fs::remove_file(&cookie_file);
                 // Only bypass cert verification for IP-only xnode bootstrap.
                 // Domain-based logins must validate the TLS cert.
@@ -552,9 +558,17 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                _ => {
-                    println!("⚠️ Rust client failed or returned 400. Attempting fallback via system curl...");
-                    let cookie_file = "/tmp/om_cookies.txt";
+                other => {
+                    let reason = match other {
+                        Ok(r) => format!("HTTP {}", r.status()),
+                        Err(e) => format!("client error: {}", e),
+                    };
+                    eprintln!("⚠️  reqwest path: {}. Falling back to system curl...", reason);
+                    // Cross-platform temp path (was hardcoded /tmp/, which does
+                    // not exist on Windows — curl silently wrote no cookies).
+                    let cookie_file_path = std::env::temp_dir().join("om_cookies.txt");
+                    let cookie_file = cookie_file_path.to_string_lossy().to_string();
+                    let cookie_file = cookie_file.as_str();
                     let _ = fs::remove_file(cookie_file); // Ensure fresh cookies
                     let mut fallback = std::process::Command::new("curl");
                     fallback.arg("-s").arg("-L");
@@ -602,10 +616,14 @@ async fn main() -> Result<()> {
                 };
                 session.save().map_err(|e| anyhow!("Failed to save session: {:?}", e))?;
                 
-                // Copy the robust cookie file to the persistent home directory
+                // Copy the robust cookie file to the persistent home directory.
+                // Source path must match the one used by the curl fallback above
+                // — use std::env::temp_dir() so it resolves correctly on Windows
+                // (the hardcoded "/tmp/..." broke Windows users silently).
                 let mut cookie_store_path = Session::get_session_path()?;
                 cookie_store_path.set_extension("jar");
-                let _ = fs::copy("/tmp/om_cookies.txt", &cookie_store_path);
+                let source_cookie_file = std::env::temp_dir().join("om_cookies.txt");
+                let _ = fs::copy(&source_cookie_file, &cookie_store_path);
                 
                 println!("💾 Session saved to local cache.");
             } else {
