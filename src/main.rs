@@ -17,6 +17,12 @@ use om::cli::output::OutputFormat;
 use om::sdk;
 use om::sdk::utils::Session;
 
+/// True for raw IPs and `.local` mDNS names — both sign for `manager.xnode.local`
+/// and accept self-signed certs.
+fn is_local_only_host(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok() || host.ends_with(".local")
+}
+
 #[derive(Parser)]
 #[command(name = "om")]
 #[command(about = "Openmesh CLI: The Sovereign Node Orchestrator", long_about = None)]
@@ -269,11 +275,8 @@ async fn main() -> Result<()> {
                     .map_err(|e| anyhow!("Invalid URL: {}", e))?;
                 let actual_host = url_parsed.host_str()
                     .ok_or_else(|| anyhow!("No host in URL"))?;
-                // For IP-only xnodes (--host override), sign for "manager.xnode.local"
-                // which is the default nginx server_name that xnode-auth validates against.
-                // Without this, the signature domain mismatches and validate returns 401.
-                let is_ip = actual_host.parse::<std::net::IpAddr>().is_ok()
-                    || host.as_ref().map_or(false, |h| h.parse::<std::net::IpAddr>().is_ok());
+                let is_ip = is_local_only_host(actual_host)
+                    || host.as_ref().map_or(false, |h| is_local_only_host(h));
                 let sign_domain = if is_ip { "manager.xnode.local" } else { host.as_deref().unwrap_or(actual_host) };
                 let domain = host.as_deref().unwrap_or(actual_host);
                 let origin = format!("https://{}", domain);
@@ -486,12 +489,7 @@ async fn main() -> Result<()> {
             // Extract domain from URL dynamically
             let url_parsed = url::Url::parse(&target_url).map_err(|e| anyhow!("Invalid URL: {}", e))?;
             let actual_host = url_parsed.host_str().ok_or_else(|| anyhow!("No host in URL"))?;
-            // For IP-only xnodes (e.g. --url https://74.50.126.86), sign for
-            // "manager.xnode.local" — the default nginx server_name that
-            // xnode-auth validates against. Without this, signature/Host
-            // mismatches and validate returns 401. Same pattern as
-            // ProfileAction::Login.
-            let is_ip = actual_host.parse::<std::net::IpAddr>().is_ok();
+            let is_ip = is_local_only_host(actual_host);
             let domain = if is_ip { "manager.xnode.local" } else { actual_host };
             let origin = format!("https://{}", domain);
 
@@ -697,4 +695,21 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local_only_host;
+
+    #[test]
+    fn local_only_host_detection() {
+        assert!(is_local_only_host("74.50.126.86"));
+        assert!(is_local_only_host("192.168.1.10"));
+        assert!(is_local_only_host("::1"));
+        assert!(is_local_only_host("own.local"));
+        assert!(is_local_only_host("xnode.local"));
+        assert!(!is_local_only_host("community.openxai.org"));
+        assert!(!is_local_only_host("manager.build.openmesh.cloud"));
+        assert!(!is_local_only_host("example.com"));
+    }
 }
