@@ -192,6 +192,24 @@ pub enum AppAction {
         action: EnvAction,
     },
 
+    /// Read a file from inside a container via the xnode-manager file API.
+    ///
+    /// Auth uses the operator's manager session cookie (out-of-band; not stored
+    /// in any container env). This is the recommended path for pulling backups
+    /// and other container-internal files — qualitatively safer than
+    /// app-level token-gated endpoints, since the credential is never on the
+    /// running app's process.
+    ///
+    /// Examples:
+    ///   om app file read xnode-v10-app /var/backups/v10/v10-daily-2026-05-01.sql.gz \
+    ///     --output ~/Backups/v10/v10-2026-05-01.sql.gz
+    ///   om app file read xnode-v10-app /xnode-config/role
+    File {
+        /// The file subcommand to run.
+        #[command(subcommand)]
+        action: FileAction,
+    },
+
     /// Remove a reverse-proxy rule for a subdomain.
     Unexpose {
         /// FQDN to remove, e.g. `demo.build.openmesh.cloud`.
@@ -245,6 +263,26 @@ pub enum EnvAction {
         /// Variable names to remove.
         #[arg(required = true)]
         keys: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FileAction {
+    /// Read a file from inside a container.
+    ///
+    /// Writes raw bytes to --output if given, otherwise to stdout. Pipe to
+    /// other tools or redirect to a file. Suitable for binary content
+    /// (gzip, etc.) and text alike.
+    Read {
+        /// The container name (e.g. xnode-v10-app).
+        name: String,
+
+        /// Absolute path inside the container (e.g. /var/backups/v10/latest.sql.gz).
+        path: String,
+
+        /// Write to this local path instead of stdout.
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
     },
 }
 
@@ -311,6 +349,9 @@ pub async fn run(action: AppAction, format: OutputFormat) -> CliResult<()> {
         }
         AppAction::Env { action: env_action } => {
             app_env(&session, env_action, format).await
+        }
+        AppAction::File { action: file_action } => {
+            app_file(&session, file_action, format).await
         }
         AppAction::SetDomain { name, domain } => {
             app_set_domain(&session, name, domain, format).await
@@ -1147,6 +1188,83 @@ async fn app_env(
         EnvAction::Set { name, pairs } => env_set(session, name, pairs, format).await,
         EnvAction::Remove { name, keys } => env_remove(session, name, keys, format).await,
     }
+}
+
+async fn app_file(
+    session: &sdk::utils::Session,
+    action: FileAction,
+    format: OutputFormat,
+) -> CliResult<()> {
+    match action {
+        FileAction::Read { name, path, output } => file_read(session, name, path, output, format).await,
+    }
+}
+
+/// Pull a file out of a container via the manager's file API. Auth is the
+/// operator's session cookie (out-of-band; not on the running app's process).
+/// Writes raw bytes to --output if given, else stdout.
+async fn file_read(
+    session: &sdk::utils::Session,
+    name: String,
+    path: String,
+    output: Option<std::path::PathBuf>,
+    _format: OutputFormat,
+) -> CliResult<()> {
+    use std::io::Write;
+
+    let scope = format!("container:{}", name);
+    let input = sdk::file::ReadFileInput {
+        session,
+        path: sdk::file::ReadFilePath { scope },
+        query: sdk::file::ReadFile { path: path.clone() },
+    };
+
+    let file = sdk::file::read_file(input).await.map_err(|e| {
+        CliError::new(
+            crate::cli::error::ErrorCode::ManagerUnreachable,
+            format!("failed to read {}: {}", path, e),
+        )
+    })?;
+
+    let bytes: Vec<u8> = match file.content {
+        sdk::utils::Output::UTF8 { output } => output.into_bytes(),
+        sdk::utils::Output::Bytes { output } => output,
+    };
+
+    match output {
+        Some(dest) => {
+            if let Some(parent) = dest.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        CliError::new(
+                            crate::cli::error::ErrorCode::ManagerUnreachable,
+                            format!("failed to create parent dir {}: {}", parent.display(), e),
+                        )
+                    })?;
+                }
+            }
+            std::fs::write(&dest, &bytes).map_err(|e| {
+                CliError::new(
+                    crate::cli::error::ErrorCode::ManagerUnreachable,
+                    format!("failed to write {}: {}", dest.display(), e),
+                )
+            })?;
+            // Stderr so stdout stays usable when the user pipes the command.
+            eprintln!("wrote {} bytes to {}", bytes.len(), dest.display());
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            handle.write_all(&bytes).map_err(|e| {
+                CliError::new(
+                    crate::cli::error::ErrorCode::ManagerUnreachable,
+                    format!("failed to write to stdout: {}", e),
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Read the current env file from the container. Returns a Vec of (key, value) pairs.
